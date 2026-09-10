@@ -811,6 +811,12 @@ class GlobalConfig:
     # PlanT
     # -----------------------------------------------------------------------------
     self.use_plant = False
+    # V2XState plug-in (team_code/v2x_features.py): K cooperative-vehicle state tokens appended to the decoder memory.
+    self.use_v2x = 0
+    self.v2x_k = 16
+    self.v2x_rate = 1.0  # penetration rate: fraction of vehicles that are connected (hash-gated, deterministic per actor id)
+    self.v2x_state_dim = 7
+    self.v2x_radius = 64.0
     self.plant_precision_pos = 7  # 7: 0.5 meters
     self.plant_precision_angle = 4  # 4: 1,875 km/h
     self.plant_precision_speed = 5  # 5: 22.5 degrees

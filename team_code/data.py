@@ -13,6 +13,7 @@ import gzip
 import laspy
 import io
 import transfuser_utils as t_u
+import v2x_features
 import gaussian_target as g_t
 import random
 from sklearn.utils.class_weight import compute_class_weight
@@ -390,7 +391,7 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
         boxes_i = None
 
         # Load bounding boxes
-        if self.config.detect_boxes or self.config.use_plant:
+        if self.config.detect_boxes or self.config.use_plant or self.config.use_v2x:
           with gzip.open(str(boxes[i], encoding='utf-8'), 'rt', encoding='utf-8') as f2:
             boxes_i = ujson.load(f2)
           if self.config.use_plant:
@@ -661,6 +662,16 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
     else:
       bounding_boxes_padded = None
       future_bounding_boxes_padded = None
+
+    if self.config.use_v2x:
+      coop_states, coop_mask, coop_bucket = v2x_features.coop_states_from_boxes(loaded_boxes[self.config.seq_len - 1],
+                                                                                k=self.config.v2x_k,
+                                                                                y_augmentation=aug_translation,
+                                                                                yaw_augmentation=aug_rotation,
+                                                                                radius=self.config.v2x_radius)
+      data['coop_states'] = coop_states
+      data['coop_mask'] = coop_mask
+      data['coop_bucket'] = coop_bucket
 
     if self.config.use_wp_gru:
       waypoints = self.get_waypoints(loaded_measurements[self.config.seq_len - 1:],

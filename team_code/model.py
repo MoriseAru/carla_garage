@@ -149,6 +149,12 @@ class LidarCenterNet(nn.Module):
         # We don't have an encoder, so we directly use it on the features
         self.encoder_pos_encoding = PositionEmbeddingSine(self.config.gru_input_size // 2, normalize=True)
         self.extra_sensor_pos_embed = nn.Parameter(torch.zeros(1, self.config.gru_input_size))
+        if self.config.use_v2x:
+          d_model = self.config.gru_input_size
+          self.coop_proj = nn.Sequential(nn.Linear(self.config.v2x_state_dim, d_model), nn.ReLU(inplace=True),
+                                         nn.Linear(d_model, d_model))
+          self.coop_slot_embedding = nn.Embedding(self.config.v2x_k, d_model)
+          self.coop_null = nn.Parameter(torch.zeros(1, 1, d_model))  # stands in for empty / non-connected slots
 
         self.change_channel = nn.Conv2d(self.backbone.num_features, self.config.gru_input_size, kernel_size=1)
 
@@ -281,7 +287,16 @@ class LidarCenterNet(nn.Module):
     if self.config.tp_attention:
       nn.init.uniform_(self.tp_pos_embed)
 
-  def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None):
+  def coop_tokens(self, coop_states, coop_mask, bs):
+    """(bs, K, d) cooperative-vehicle tokens; invalid or non-connected slots become the learned null token."""
+    k = self.config.v2x_k
+    null = self.coop_null.expand(bs, k, -1)
+    if coop_states is None:
+      return null
+    tok = self.coop_proj(coop_states) + self.coop_slot_embedding.weight[None, :k]
+    return torch.where(coop_mask[..., None] > 0.5, tok, null)
+
+  def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None, coop_states=None, coop_mask=None):
     bs = rgb.shape[0]
     if self.config.two_tp_input:
       target_point = torch.cat((target_point, target_point_next), axis=1)
@@ -329,6 +344,8 @@ class LidarCenterNet(nn.Module):
 
       if self.config.transformer_decoder_join:
         fused_features = torch.permute(fused_features, (0, 2, 1))
+        if self.config.use_v2x:  # V2XState plug-in: cooperative vehicle states join the decoder memory
+          fused_features = torch.cat((fused_features, self.coop_tokens(coop_states, coop_mask, bs)), dim=1)
         if self.config.use_wp_gru:
           if self.config.multi_wp_output:
             joined_wp_features = self.join(self.wp_query.repeat(bs, 1, 1), fused_features)

@@ -29,6 +29,7 @@ from scipy.optimize import fsolve
 
 from scenario_logger import ScenarioLogger
 import transfuser_utils as t_u
+import v2x_features
 
 import pathlib
 import jsonpickle
@@ -271,6 +272,28 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self._route_planner.set_route(self._global_plan, True)
     self.initialized = True
 
+  def v2x_states(self):
+    """States of the connected vehicles (hash-gated penetration V2X_RATE, default config.v2x_rate) in the ego frame,
+    using the same relative transform as the recorded training boxes."""
+    from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  # pylint: disable=import-outside-toplevel
+    ego = CarlaDataProvider.get_hero_actor()
+    ego_tf = ego.get_transform()
+    ego_matrix = np.array(ego_tf.get_matrix())
+    ego_yaw = np.deg2rad(ego_tf.rotation.yaw)
+    vehicles = []
+    for actor in CarlaDataProvider.get_all_actors().filter('vehicle.*'):
+      if actor.id == ego.id:
+        continue
+      tf = actor.get_transform()
+      vel = actor.get_velocity()
+      vehicles.append((actor.id, np.array(tf.get_matrix()), np.deg2rad(tf.rotation.yaw),
+                       math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2), 2.0 * actor.bounding_box.extent.x))
+    rate = float(os.environ.get('V2X_RATE', self.config.v2x_rate))
+    states, mask = v2x_features.coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=self.config.v2x_k, rate=rate,
+                                                       radius=self.config.v2x_radius,
+                                                       relative_transform=t_u.get_relative_transform)
+    return states.to(self.device), mask.to(self.device)
+
   def sensors(self):
     sensors = [{
         'type': 'sensor.camera.rgb',
@@ -506,6 +529,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       dt = self.config.carla_frame_rate
       self.meters_travelled = self.meters_travelled + speed * dt
 
+    # V2XState plug-in: connected vehicles' ground-truth states from the simulator (privileged, by design of the premise)
+    coop_states = coop_mask = None
+    if getattr(self.config, 'use_v2x', 0):
+      coop_states, coop_mask = self.v2x_states()
+
     # forward pass
     pred_wps = []
     pred_target_speeds = []
@@ -529,7 +557,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           target_point=tick_data['target_point'],
           target_point_next=tick_data['target_point_next'] if self.config.two_tp_input else None,
           ego_vel=velocity,
-          command=tick_data['command'])
+          command=tick_data['command'],
+          coop_states=coop_states,
+          coop_mask=coop_mask)
         # Only convert bounding boxes when they are used.
         if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
                                          self.stop_sign_controller):

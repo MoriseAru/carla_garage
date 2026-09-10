@@ -22,6 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import optim
 from torch.utils.data import DataLoader
+import v2x_features
 from torch.utils.tensorboard import SummaryWriter
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import ZeroRedundancyOptimizer
@@ -103,6 +104,11 @@ def main():
                       default=config.lidar_architecture,
                       help='Which architecture to use for the lidar branch. Tested: resnet34, regnety_032.'
                       'Has the special video option video_resnet18 and video_swin_tiny.')
+  parser.add_argument('--use_v2x', type=int, default=config.use_v2x,
+                      help='V2XState plug-in: append cooperative vehicle state tokens to the decoder memory (0/1).')
+  parser.add_argument('--v2x_k', type=int, default=config.v2x_k, help='Number of cooperative vehicle slots.')
+  parser.add_argument('--v2x_rate', type=float, default=config.v2x_rate,
+                      help='Penetration rate applied during training (hash-gated per actor id).')
   parser.add_argument('--use_velocity',
                       type=int,
                       default=config.use_velocity,
@@ -826,6 +832,12 @@ class Engine(object):
       else:
         lidar = data['lidar'].to(self.device, dtype=torch.float32)
 
+      coop_states = coop_mask = None
+      if self.config.use_v2x:
+        coop_states = data['coop_states'].to(self.device, dtype=torch.float32)
+        coop_mask = data['coop_mask'].to(self.device, dtype=torch.float32)
+        coop_states, coop_mask = v2x_features.apply_rate(coop_states, coop_mask, data['coop_bucket'].to(self.device),
+                                                         self.config.v2x_rate)
       pred_wp,\
       pred_target_speed,\
       pred_checkpoint,\
@@ -839,7 +851,9 @@ class Engine(object):
                           target_point=target_point,
                           ego_vel=ego_vel,
                           command=command,
-                          target_point_next=target_point_next if self.config.two_tp_input else None,)
+                          target_point_next=target_point_next if self.config.two_tp_input else None,
+                          coop_states=coop_states,
+                          coop_mask=coop_mask)
     else:
       raise ValueError('The chosen vision backbone does not exist. The options are: transFuser, aim, bev_encoder')
 
