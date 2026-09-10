@@ -2,7 +2,7 @@
 1) config with use_v2x=1 -> LidarCenterNet builds; forward with random rgb/lidar + coop tokens; loss-free backward reaches coop params;
    rate-0 (all slots null) vs rate-1 outputs differ; 2) apply_rate keeps the hash-selected subset; 3) CARLA_Data on one downloaded
    scenario yields coop_states/coop_mask/coop_bucket of the right shapes with plausible values.
-  python tools/v2x_smoke.py --root /work/gn21/n21001/carla_garage_data/CrossingBicycleFlow
+  python tools/v2x_smoke.py --root /work/gn21/n21001/carla_garage_smoke_root   # a dir whose children are scenario folders
 """
 import argparse, glob, os, sys, time
 import numpy as np, torch
@@ -11,7 +11,8 @@ import config as cfgmod, model as modmod, data as datamod, v2x_features
 
 ap = argparse.ArgumentParser(); ap.add_argument("--root", required=True); a = ap.parse_args()
 dev = "cuda" if torch.cuda.is_available() else "cpu"
-cfg = cfgmod.GlobalConfig(); cfg.initialize(root_dir=a.root, setting="all", use_v2x=1, v2x_k=16, v2x_rate=1.0)
+cfg = cfgmod.GlobalConfig(); cfg.initialize(root_dir=[a.root], setting="all", use_v2x=1, v2x_k=16, v2x_rate=1.0)
+print("data roots:", cfg.data_roots)
 net = modmod.LidarCenterNet(cfg).to(dev)
 n_coop = sum(p.numel() for n, p in net.named_parameters() if "coop_" in n)
 print(f"model built on {dev}: {sum(p.numel() for p in net.parameters())/1e6:.1f}M params, coop params {n_coop}")
@@ -38,7 +39,7 @@ bucket = torch.randint(0, 1000, (bs, 16), device=dev)
 s5, m5 = v2x_features.apply_rate(states, mask, bucket, 0.5); print(f"apply_rate 0.5 keeps {int(m5.sum())} of {int(mask.sum())} slots; rate 0 keeps {int(v2x_features.apply_rate(states, mask, bucket, 0.0)[1].sum())}")
 # dataset
 t0 = time.time()
-ds = datamod.CARLA_Data(root=[a.root], config=cfg, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
+ds = datamod.CARLA_Data(root=cfg.data_roots, config=cfg, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
 print(f"dataset: {len(ds)} samples from {a.root} ({time.time()-t0:.0f}s)")
 for i in np.linspace(0, len(ds) - 1, 3).astype(int):
     d = ds[i]; cs, cm, cb = d["coop_states"], d["coop_mask"], d["coop_bucket"]
