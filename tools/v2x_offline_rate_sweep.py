@@ -23,7 +23,7 @@ def load(run_dir):
 
 
 cfg_v, net_v = load(a.v2x); cfg_b, net_b = load(a.base)
-cfg_v.augment = 0; cfg_v.initialize(root_dir=[a.root], setting="all", use_v2x=1)   # dataset with coop states, no augmentation
+cfg_v.initialize(root_dir=[a.root], setting="all", use_v2x=1)   # dataset with coop states (augmentation kept: identical batch for every condition)
 ds = datamod.CARLA_Data(root=cfg_v.data_roots, config=cfg_v, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
 g = torch.Generator().manual_seed(0); idx = torch.randperm(len(ds), generator=g)[: a.n].tolist()
 sub = torch.utils.data.Subset(ds, idx); dl = torch.utils.data.DataLoader(sub, batch_size=a.bs, shuffle=False, num_workers=16)
