@@ -6,6 +6,7 @@ v2x at rate 0 with the coop tokens REMOVED from the decoder memory ("drop") inst
 Metrics vs expert labels: target-speed class accuracy / CE, checkpoint L1 (m), plus the coop-slot fill statistics of the data.
 """
 import argparse, os, sys, json
+os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 import numpy as np, torch, torch.nn.functional as F
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "team_code"))
 import jsonpickle, jsonpickle.ext.numpy as jsonpickle_numpy; jsonpickle_numpy.register_handlers()
@@ -39,7 +40,9 @@ with torch.no_grad():
         rgb = data["rgb"].to(dev, dtype=torch.float32); lidar = data["lidar"].to(dev, dtype=torch.float32)
         tp = data["target_point"].to(dev, dtype=torch.float32); tpn = data["target_point_next"].to(dev, dtype=torch.float32) if cfg_v.two_tp_input else None
         vel = data["speed"].to(dev, dtype=torch.float32).unsqueeze(1); cmd = data["command"].to(dev, dtype=torch.float32)
-        ts_label = data["target_speed"].to(dev); ckpt_label = data["route"][:, : cfg_v.predict_checkpoint_len].to(dev, dtype=torch.float32)
+        ts_label = data["target_speed_twohot"].to(dev, dtype=torch.float32).argmax(1)   # class index of the expert target speed
+        ckpt_label = data["route"][:, : cfg_v.predict_checkpoint_len].to(dev, dtype=torch.float32)
+        if n == 0: print("label check: ts classes", int(ts_label.min()), "-", int(ts_label.max()), "of", len(cfg_v.target_speeds), "; ckpt", tuple(ckpt_label.shape), "; cmd", tuple(cmd.shape), flush=True)
         st = data["coop_states"].to(dev, dtype=torch.float32); mk = data["coop_mask"].to(dev, dtype=torch.float32); bk = data["coop_bucket"].to(dev)
         fill += mk.sum(1).tolist(); any_null += int((mk.sum(1) < cfg_v.v2x_k).sum()); bs = rgb.shape[0]
         for c in conds:
