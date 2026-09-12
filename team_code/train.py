@@ -109,6 +109,9 @@ def main():
   parser.add_argument('--v2x_k', type=int, default=config.v2x_k, help='Number of cooperative vehicle slots.')
   parser.add_argument('--v2x_rate', type=float, default=config.v2x_rate,
                       help='Penetration rate applied during training (hash-gated per actor id).')
+  parser.add_argument('--v2x_rate_dropout', type=int, default=config.v2x_rate_dropout,
+                      help='1: random per-sample penetration during training (rate 0 with prob v2x_p_zero, else U(0,1]).')
+  parser.add_argument('--v2x_p_zero', type=float, default=config.v2x_p_zero, help='P(rate = 0) under v2x_rate_dropout.')
   parser.add_argument('--use_velocity',
                       type=int,
                       default=config.use_velocity,
@@ -836,8 +839,12 @@ class Engine(object):
       if self.config.use_v2x:
         coop_states = data['coop_states'].to(self.device, dtype=torch.float32)
         coop_mask = data['coop_mask'].to(self.device, dtype=torch.float32)
-        coop_states, coop_mask = v2x_features.apply_rate(coop_states, coop_mask, data['coop_bucket'].to(self.device),
-                                                         self.config.v2x_rate)
+        if self.config.v2x_rate_dropout and not validation:
+          coop_states, coop_mask, _ = v2x_features.apply_random_rate(coop_states, coop_mask, data['coop_bucket'].to(self.device),
+                                                                     p_zero=self.config.v2x_p_zero)
+        else:
+          coop_states, coop_mask = v2x_features.apply_rate(coop_states, coop_mask, data['coop_bucket'].to(self.device),
+                                                           self.config.v2x_rate)
       pred_wp,\
       pred_target_speed,\
       pred_checkpoint,\

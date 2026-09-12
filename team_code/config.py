@@ -815,6 +815,8 @@ class GlobalConfig:
     self.use_v2x = 0
     self.v2x_k = 16
     self.v2x_rate = 1.0  # penetration rate: fraction of vehicles that are connected (hash-gated, deterministic per actor id)
+    self.v2x_rate_dropout = 0  # 1: per-sample random penetration during training (P(rate=0)=v2x_p_zero, else U(0,1]) -> graceful degradation
+    self.v2x_p_zero = 0.25
     self.v2x_state_dim = 7
     self.v2x_radius = 64.0
     self.plant_precision_pos = 7  # 7: 0.5 meters

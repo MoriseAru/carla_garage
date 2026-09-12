@@ -65,6 +65,17 @@ def apply_rate(states, mask, bucket, rate):
     return states, mask * keep
 
 
+def apply_random_rate(states, mask, bucket, p_zero=0.25, generator=None):
+    """Training-time penetration dropout: per sample, with probability p_zero no vehicle cooperates (rate 0), otherwise the
+    rate is drawn uniformly from (0, 1]. Slots are kept iff bucket < rate * BUCKETS, so a given vehicle's participation is
+    still consistent within a sample. Returns (states, mask, rates)."""
+    bs = mask.shape[0]
+    rates = torch.rand(bs, device=mask.device, generator=generator)
+    rates = torch.where(torch.rand(bs, device=mask.device, generator=generator) < p_zero, torch.zeros_like(rates), rates)
+    keep = (bucket < (rates[:, None] * BUCKETS).long()).to(mask.dtype)
+    return states, mask * keep, rates
+
+
 def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius=64.0, relative_transform=None):
     """Closed-loop counterpart. `vehicles` = iterable of (actor_id, actor_matrix(4x4), yaw_rad, speed, length);
     `relative_transform(ego_matrix, actor_matrix)` must be team_code.transfuser_utils.get_relative_transform so the
