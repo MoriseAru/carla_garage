@@ -25,8 +25,12 @@ def _state(x, y, yaw, speed, length):
     return [x / 32.0, y / 32.0, speed * math.cos(yaw) / 10.0, speed * math.sin(yaw) / 10.0, math.cos(yaw), math.sin(yaw), length / 5.0]
 
 
-def coop_states_from_boxes(boxes, k=16, y_augmentation=0.0, yaw_augmentation=0.0, radius=64.0):
-    """From one frame's recorded boxes (list of dicts). Returns (states (k,7) f32, mask (k,) f32, bucket (k,) i64).
+def coop_states_from_boxes(boxes, k=16, y_augmentation=0.0, yaw_augmentation=0.0, radius=64.0, hidden_pts=5, hazard_range=30.0,
+                           hazard_lat=12.0, moving=1.0):
+    """From one frame's recorded boxes (list of dicts). Returns (states (k,7) f32, mask (k,) f32, bucket (k,) i64,
+    hidden (k,) f32, hazard (k,) f32). hidden: <= hidden_pts ego-lidar points inside the box (the ego's own sensors do not
+    see it); hazard: moving vehicle ahead within hazard_range m and |lateral| <= hazard_lat m -- the case where a shared
+    state carries information the ego cannot get itself.
     Applies the same rotation/translation augmentation as CARLA_Data.get_bbox_label so the tokens stay aligned with the
     augmented lidar BEV. No visibility filter: hidden connected vehicles are exactly what the plug-in adds."""
     aug = math.radians(yaw_augmentation)
@@ -45,14 +49,19 @@ def coop_states_from_boxes(boxes, k=16, y_augmentation=0.0, yaw_augmentation=0.0
         spd = b.get("speed", 0.0)
         spd = 0.0 if spd is None or (isinstance(spd, float) and math.isnan(spd)) else float(spd)
         ext = b.get("extent", [2.0, 1.0, 0.8])
-        cands.append((dist, _state(x, y, yaw, spd, 2.0 * float(ext[0])), bucket_of(b.get("id", len(cands)))))
+        npts = b.get("num_points")
+        hid = 1.0 if (npts is not None and 0 <= int(npts) <= hidden_pts) else 0.0
+        haz = 1.0 if (0.0 < x <= hazard_range and abs(y) <= hazard_lat and spd > moving) else 0.0
+        cands.append((dist, _state(x, y, yaw, spd, 2.0 * float(ext[0])), bucket_of(b.get("id", len(cands))), hid, haz))
     cands.sort(key=lambda t: t[0])
     states = np.zeros((k, STATE_DIM), dtype=np.float32)
     mask = np.zeros((k,), dtype=np.float32)
     bucket = np.full((k,), BUCKETS, dtype=np.int64)     # padded slots never cooperate
-    for j, (_, vec, bk) in enumerate(cands[:k]):
-        states[j], mask[j], bucket[j] = vec, 1.0, bk
-    return states, mask, bucket
+    hidden = np.zeros((k,), dtype=np.float32)
+    hazard = np.zeros((k,), dtype=np.float32)
+    for j, (_, vec, bk, hid, haz) in enumerate(cands[:k]):
+        states[j], mask[j], bucket[j], hidden[j], hazard[j] = vec, 1.0, bk, hid, haz
+    return states, mask, bucket, hidden, hazard
 
 
 def apply_rate(states, mask, bucket, rate):

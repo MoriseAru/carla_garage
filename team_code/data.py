@@ -664,14 +664,18 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
       future_bounding_boxes_padded = None
 
     if self.config.use_v2x:
-      coop_states, coop_mask, coop_bucket = v2x_features.coop_states_from_boxes(loaded_boxes[self.config.seq_len - 1],
-                                                                                k=self.config.v2x_k,
-                                                                                y_augmentation=aug_translation,
-                                                                                yaw_augmentation=aug_rotation,
-                                                                                radius=self.config.v2x_radius)
+      coop_states, coop_mask, coop_bucket, coop_hidden, coop_hazard = v2x_features.coop_states_from_boxes(
+          loaded_boxes[self.config.seq_len - 1], k=self.config.v2x_k, y_augmentation=aug_translation,
+          yaw_augmentation=aug_rotation, radius=self.config.v2x_radius, hidden_pts=self.config.v2x_hidden_pts,
+          hazard_range=self.config.v2x_hazard_range)
       data['coop_states'] = coop_states
       data['coop_mask'] = coop_mask
       data['coop_bucket'] = coop_bucket
+      data['coop_hidden'] = coop_hidden
+      data['coop_hazard'] = coop_hazard
+      # expert is slowing down / yielding: brake, or target speed clearly below current speed (both m/s)
+      data['slowdown'] = np.float32(1.0 if (bool(current_measurement['brake']) or
+                                            float(current_measurement['target_speed']) < float(current_measurement['speed']) - 1.0) else 0.0)
 
     if self.config.use_wp_gru:
       waypoints = self.get_waypoints(loaded_measurements[self.config.seq_len - 1:],

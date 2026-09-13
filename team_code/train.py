@@ -112,6 +112,12 @@ def main():
   parser.add_argument('--v2x_rate_dropout', type=int, default=config.v2x_rate_dropout,
                       help='1: random per-sample penetration during training (rate 0 with prob v2x_p_zero, else U(0,1]).')
   parser.add_argument('--v2x_p_zero', type=float, default=config.v2x_p_zero, help='P(rate = 0) under v2x_rate_dropout.')
+  parser.add_argument('--use_v2x_aux', type=int, default=config.use_v2x_aux,
+                      help='Scheme C: auxiliary hidden-hazard head trained only on samples that received tokens.')
+  parser.add_argument('--v2x_occ_weight', type=float, default=config.v2x_occ_weight,
+                      help='Scheme C: loss weight for frames with a hidden connected hazard while the expert slows down (1 = off).')
+  parser.add_argument('--v2x_hidden_pts', type=int, default=config.v2x_hidden_pts, help='<= this many lidar points -> hidden.')
+  parser.add_argument('--v2x_hazard_range', type=float, default=config.v2x_hazard_range, help='hazard range ahead (m).')
   parser.add_argument('--use_velocity',
                       type=int,
                       default=config.use_velocity,
@@ -836,15 +842,25 @@ class Engine(object):
         lidar = data['lidar'].to(self.device, dtype=torch.float32)
 
       coop_states = coop_mask = None
+      occ_sample_weight = aux_label = aux_mask = None
       if self.config.use_v2x:
         coop_states = data['coop_states'].to(self.device, dtype=torch.float32)
         coop_mask = data['coop_mask'].to(self.device, dtype=torch.float32)
         if self.config.v2x_rate_dropout and not validation:
-          coop_states, coop_mask, _ = v2x_features.apply_random_rate(coop_states, coop_mask, data['coop_bucket'].to(self.device),
-                                                                     p_zero=self.config.v2x_p_zero)
+          coop_states, coop_mask, rates = v2x_features.apply_random_rate(coop_states, coop_mask, data['coop_bucket'].to(self.device),
+                                                                         p_zero=self.config.v2x_p_zero)
         else:
           coop_states, coop_mask = v2x_features.apply_rate(coop_states, coop_mask, data['coop_bucket'].to(self.device),
                                                            self.config.v2x_rate)
+          rates = torch.full((coop_mask.shape[0],), float(self.config.v2x_rate), device=self.device)
+        # scheme C: a CONNECTED (kept) vehicle that the ego's lidar does not see and that is a moving hazard ahead
+        occ_conn = ((coop_mask * data['coop_hidden'].to(self.device) * data['coop_hazard'].to(self.device)).sum(1) > 0).float()
+        if self.config.v2x_occ_weight > 1.0 and not validation:
+          w = 1.0 + (self.config.v2x_occ_weight - 1.0) * occ_conn * data['slowdown'].to(self.device, dtype=torch.float32)
+          occ_sample_weight = w / w.mean()
+        if self.config.use_v2x_aux:
+          aux_label = occ_conn
+          aux_mask = (rates > 0).float()
       pred_wp,\
       pred_target_speed,\
       pred_checkpoint,\
@@ -900,7 +916,10 @@ class Engine(object):
                             pixel_weight_label=bb_pixel_weight,
                             avg_factor_label=bb_avg_factor,
                             pred_wp_1=pred_wp_1,
-                            selected_path=selected_path)
+                            selected_path=selected_path,
+                            sample_weight=occ_sample_weight,
+                            aux_label=aux_label,
+                            aux_mask=aux_mask)
 
     # Compute metrics for logging
     metrics = {}

@@ -500,6 +500,7 @@ class GlobalConfig:
         'loss_brake': 1.0,
         'loss_forcast': 0.2,
         'loss_selection': 0.0,
+        'loss_hidden_hazard': 1.0,
     }
     self.root_dir = ''
     self.val_towns = []
@@ -819,6 +820,13 @@ class GlobalConfig:
     self.v2x_p_zero = 0.25
     self.v2x_state_dim = 7
     self.v2x_radius = 64.0
+    # scheme C: make the tokens worth reading. Frames where a CONNECTED vehicle is hidden from the ego's lidar, is a moving
+    # hazard ahead, and the expert slows down get v2x_occ_weight x loss on the planning heads; an auxiliary head must
+    # predict "a hidden hazard exists" from the decoder features (loss only on samples that received tokens).
+    self.v2x_hidden_pts = 5        # <= this many lidar points in the box -> hidden from the ego
+    self.v2x_hazard_range = 30.0   # m ahead
+    self.v2x_occ_weight = 1.0      # >1 enables occlusion weighting
+    self.use_v2x_aux = 0           # 1 enables the hidden-hazard auxiliary head (+ 'loss_hidden_hazard')
     self.plant_precision_pos = 7  # 7: 0.5 meters
     self.plant_precision_angle = 4  # 4: 1,875 km/h
     self.plant_precision_speed = 5  # 5: 22.5 degrees
