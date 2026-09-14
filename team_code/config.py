@@ -826,7 +826,8 @@ class GlobalConfig:
     # predict "a hidden hazard exists" from the decoder features (loss only on samples that received tokens).
     self.v2x_hidden_pts = 5        # <= this many lidar points in the box -> hidden from the ego
     self.v2x_hazard_range = 30.0   # m ahead
-    self.v2x_occ_weight = 1.0      # >1 enables occlusion weighting
+    self.v2x_occ_weight = 1.0      # >1 enables occlusion weighting (frames with a connected hidden hazard AND the expert slowing)
+    self.v2x_occ_weight_all = 1.0  # >1 additionally weights every frame with a connected hidden hazard (slowing or not)
     self.use_v2x_aux = 0           # 1 enables the hidden-hazard auxiliary head (+ 'loss_hidden_hazard')
     self.use_v2x_aux_reg = 0       # 1 adds regression of the nearest connected hidden hazard's [x/32, y/32, vx/10, vy/10] (+ 'loss_hidden_reg');
                                    #   the target is only knowable from the token -> the decoder must read the token states

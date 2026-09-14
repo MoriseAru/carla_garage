@@ -16,7 +16,7 @@ dev = "cuda" if torch.cuda.is_available() else "cpu"; ok = True
 def check(cond, msg):
     global ok; print(("PASS " if cond else "FAIL ") + msg); ok = ok and bool(cond)
 
-cfg = cfgmod.GlobalConfig(); cfg.initialize(root_dir=[a.root], setting="all", use_v2x=1, use_v2x_aux=1, use_v2x_aux_reg=1, v2x_occ_weight=4.0, v2x_rate_dropout=1, v2x_p_zero=0.1)
+cfg = cfgmod.GlobalConfig(); cfg.initialize(root_dir=[a.root], setting="all", use_v2x=1, use_v2x_aux=1, use_v2x_aux_reg=1, v2x_occ_weight=8.0, v2x_occ_weight_all=3.0, v2x_rate_dropout=1, v2x_p_zero=0.1)
 check("loss_hidden_hazard" in cfg.detailed_loss_weights and "loss_hidden_reg" in cfg.detailed_loss_weights, "config has loss_hidden_hazard / loss_hidden_reg weights")
 ds = datamod.CARLA_Data(root=cfg.data_roots, config=cfg, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
 sub = torch.utils.data.Subset(ds, torch.randperm(len(ds), generator=torch.Generator().manual_seed(0))[: a.n].tolist())

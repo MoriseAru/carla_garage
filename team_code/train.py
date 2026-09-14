@@ -117,6 +117,8 @@ def main():
   parser.add_argument('--v2x_occ_weight', type=float, default=config.v2x_occ_weight,
                       help='Scheme C: loss weight for frames with a hidden connected hazard while the expert slows down (1 = off).')
   parser.add_argument('--v2x_hidden_pts', type=int, default=config.v2x_hidden_pts, help='<= this many lidar points -> hidden.')
+  parser.add_argument('--v2x_occ_weight_all', type=float, default=config.v2x_occ_weight_all,
+                      help='Scheme C: extra loss weight on every frame with a connected hidden hazard (1 = off).')
   parser.add_argument('--use_v2x_aux_reg', type=int, default=config.use_v2x_aux_reg,
                       help='Scheme C+: regress the nearest connected hidden hazard state (only knowable from the token).')
   parser.add_argument('--v2x_hazard_range', type=float, default=config.v2x_hazard_range, help='hazard range ahead (m).')
@@ -857,8 +859,10 @@ class Engine(object):
           rates = torch.full((coop_mask.shape[0],), float(self.config.v2x_rate), device=self.device)
         # scheme C: a CONNECTED (kept) vehicle that the ego's lidar does not see and that is a moving hazard ahead
         occ_conn = ((coop_mask * data['coop_hidden'].to(self.device) * data['coop_hazard'].to(self.device)).sum(1) > 0).float()
-        if self.config.v2x_occ_weight > 1.0 and not validation:
-          w = 1.0 + (self.config.v2x_occ_weight - 1.0) * occ_conn * data['slowdown'].to(self.device, dtype=torch.float32)
+        w_all = getattr(self.config, 'v2x_occ_weight_all', 1.0)
+        if (self.config.v2x_occ_weight > 1.0 or w_all > 1.0) and not validation:
+          w = 1.0 + (self.config.v2x_occ_weight - 1.0) * occ_conn * data['slowdown'].to(self.device, dtype=torch.float32) \
+                  + (w_all - 1.0) * occ_conn
           occ_sample_weight = w / w.mean()
         if self.config.use_v2x_aux:
           aux_label = occ_conn
