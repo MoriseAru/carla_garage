@@ -16,7 +16,9 @@ dev = "cuda" if torch.cuda.is_available() else "cpu"; ok = True
 def check(cond, msg):
     global ok; print(("PASS " if cond else "FAIL ") + msg); ok = ok and bool(cond)
 
-cfg = cfgmod.GlobalConfig(); cfg.initialize(root_dir=[a.root], setting="all", use_v2x=1, use_v2x_aux=1, use_v2x_aux_reg=1, v2x_occ_weight=8.0, v2x_occ_weight_all=3.0, v2x_rate_dropout=1, v2x_p_zero=0.1)
+torch.manual_seed(0)
+SET = dict(use_v2x=1, use_v2x_aux=1, use_v2x_aux_reg=1, v2x_occ_weight=8.0, v2x_occ_weight_all=3.0, v2x_rate_dropout=1, v2x_p_zero=0.1)
+cfg = cfgmod.GlobalConfig(); cfg.initialize(root_dir=[a.root], setting="all", **SET)
 check("loss_hidden_hazard" in cfg.detailed_loss_weights and "loss_hidden_reg" in cfg.detailed_loss_weights, "config has loss_hidden_hazard / loss_hidden_reg weights")
 ds = datamod.CARLA_Data(root=cfg.data_roots, config=cfg, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
 sub = torch.utils.data.Subset(ds, torch.randperm(len(ds), generator=torch.Generator().manual_seed(0))[: a.n].tolist())
@@ -28,7 +30,8 @@ for d in dl:
     check(hid.shape == mk.shape and haz.shape == mk.shape and sl.shape == (mk.shape[0],), "shapes coop_hidden/coop_hazard (bs,K), slowdown (bs,)") if n == 0 else None
     oc = ((mk * hid * haz).sum(1) > 0).float(); occ_any += int(oc.sum()); occ_slow += int((oc * sl).sum()); slow += int(sl.sum())
     hid_cnt += int((mk * hid).sum()); haz_cnt += int((mk * haz).sum()); n += mk.shape[0]
-    if first is None: first = d
+    if first is None and int(oc.sum()) >= 2: first = d     # a batch with >= 2 connected hidden hazards, so the reg/aux paths are exercised
+if first is None: first = d
 print(f"frames {n}: hidden vehicles/frame {hid_cnt/n:.2f}, hazard vehicles/frame {haz_cnt/n:.2f}; frames with hidden hazard {100*occ_any/n:.1f}%, "
       f"expert slowing {100*slow/n:.1f}%, up-weighted (both) {100*occ_slow/n:.1f}%")
 check(0 < occ_any < n, "hidden-hazard frames exist but are not all frames"); check(0 < slow < n, "slowdown label varies")
@@ -62,7 +65,9 @@ with torch.no_grad():
           f"weight==1 reproduces unweighted losses (ts {float(l_plain['loss_target_speed']):.4f} vs {float(l_w1['loss_target_speed']):.4f})")
     check("loss_hidden_hazard" not in l_plain, "no aux loss when no aux label passed")
     # scheme C path as in train.py
-    s2, m2, rates = v2x_features.apply_random_rate(st, mk, bk, p_zero=0.5)
+    s2, m2, rates = v2x_features.apply_random_rate(st, mk, bk, p_zero=0.5, generator=torch.Generator(device=dev).manual_seed(1))
+    if int((m2 * d["coop_hidden"].to(dev) * d["coop_hazard"].to(dev)).sum(1).gt(0).sum()) == 0:   # make sure at least one kept hidden hazard survives the gating
+        s2, m2, rates = st, mk, torch.ones(bs, device=dev)
     occ = ((m2 * d["coop_hidden"].to(dev) * d["coop_hazard"].to(dev)).sum(1) > 0).float(); w = 1 + 3 * occ * d["slowdown"].to(dev).float(); w = w / w.mean()
     l_c, out = run(s2, m2, w, occ, (rates > 0).float())
     check("loss_hidden_hazard" in l_c and torch.isfinite(l_c["loss_hidden_hazard"]), f"aux loss present and finite: {float(l_c['loss_hidden_hazard']):.4f} (rate>0 samples {int((rates>0).sum())}/{bs})")
@@ -79,7 +84,7 @@ g = [n_ for n_, p in net.named_parameters() if "hidden_hazard_head" in n_ and p.
 check(len(g) == 4, f"grad reached aux head params {len(g)}/4")
 g2 = [n_ for n_, p in net.named_parameters() if "hidden_reg_head" in n_ and p.grad is not None and p.grad.abs().sum() > 0]; check(len(g2) == 4, f"grad reached reg head params {len(g2)}/4"); check(all(k in cfg.detailed_loss_weights for k in l_c), "every loss key has a weight in config (train loop would KeyError otherwise)")
 # ---- (5) config round trip ----
-c2 = jsonpickle.decode(jsonpickle.encode(cfg)); check(getattr(c2, "use_v2x_aux", None) == 1 and getattr(c2, "use_v2x_aux_reg", None) == 1 and getattr(c2, "v2x_occ_weight", None) == 4.0 and getattr(c2, "v2x_p_zero", None) == 0.1, "config.json round-trip keeps scheme-C fields")
+c2 = jsonpickle.decode(jsonpickle.encode(cfg)); check(all(getattr(c2, k, None) == v for k, v in SET.items()), "config.json round-trip keeps scheme-C fields: " + str({k: getattr(c2, k, None) for k in SET}))
 # baseline model (use_v2x=0) must still build and run compute_loss without any aux kwargs
 cfg0 = cfgmod.GlobalConfig(); cfg0.initialize(root_dir=[a.root], setting="all")
 net0 = modmod.LidarCenterNet(cfg0).to(dev).eval()
