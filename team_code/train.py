@@ -117,6 +117,8 @@ def main():
   parser.add_argument('--v2x_occ_weight', type=float, default=config.v2x_occ_weight,
                       help='Scheme C: loss weight for frames with a hidden connected hazard while the expert slows down (1 = off).')
   parser.add_argument('--v2x_hidden_pts', type=int, default=config.v2x_hidden_pts, help='<= this many lidar points -> hidden.')
+  parser.add_argument('--use_v2x_aux_reg', type=int, default=config.use_v2x_aux_reg,
+                      help='Scheme C+: regress the nearest connected hidden hazard state (only knowable from the token).')
   parser.add_argument('--v2x_hazard_range', type=float, default=config.v2x_hazard_range, help='hazard range ahead (m).')
   parser.add_argument('--use_velocity',
                       type=int,
@@ -842,7 +844,7 @@ class Engine(object):
         lidar = data['lidar'].to(self.device, dtype=torch.float32)
 
       coop_states = coop_mask = None
-      occ_sample_weight = aux_label = aux_mask = None
+      occ_sample_weight = aux_label = aux_mask = aux_reg_label = aux_reg_mask = None
       if self.config.use_v2x:
         coop_states = data['coop_states'].to(self.device, dtype=torch.float32)
         coop_mask = data['coop_mask'].to(self.device, dtype=torch.float32)
@@ -861,6 +863,12 @@ class Engine(object):
         if self.config.use_v2x_aux:
           aux_label = occ_conn
           aux_mask = (rates > 0).float()
+        if getattr(self.config, 'use_v2x_aux_reg', 0):
+          # nearest (slots are distance-sorted) connected hidden hazard: its normalised [x, y, vx, vy] from the token itself
+          cand = coop_mask * data['coop_hidden'].to(self.device) * data['coop_hazard'].to(self.device)       # (bs, K)
+          first = torch.argmax(cand, dim=1)                                                                    # first slot with cand == 1 (or 0 if none)
+          aux_reg_label = coop_states[torch.arange(coop_states.shape[0], device=self.device), first, :4]
+          aux_reg_mask = (cand.sum(1) > 0).float()
       pred_wp,\
       pred_target_speed,\
       pred_checkpoint,\
@@ -919,7 +927,9 @@ class Engine(object):
                             selected_path=selected_path,
                             sample_weight=occ_sample_weight,
                             aux_label=aux_label,
-                            aux_mask=aux_mask)
+                            aux_mask=aux_mask,
+                            aux_reg_label=aux_reg_label,
+                            aux_reg_mask=aux_reg_mask)
 
     # Compute metrics for logging
     metrics = {}

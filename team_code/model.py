@@ -157,6 +157,8 @@ class LidarCenterNet(nn.Module):
           self.coop_null = nn.Parameter(torch.zeros(1, 1, d_model))  # stands in for empty / non-connected slots
           if self.config.use_v2x_aux:
             self.hidden_hazard_head = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, 1))
+          if getattr(self.config, 'use_v2x_aux_reg', 0):
+            self.hidden_reg_head = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, 4))
 
         self.change_channel = nn.Conv2d(self.backbone.num_features, self.config.gru_input_size, kernel_size=1)
 
@@ -301,6 +303,7 @@ class LidarCenterNet(nn.Module):
   def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None, coop_states=None, coop_mask=None):
     bs = rgb.shape[0]
     self._aux_logit = None   # hidden-hazard auxiliary prediction (scheme C), read by compute_loss
+    self._aux_reg = None     # nearest connected hidden hazard state regression (scheme C+)
     if self.config.two_tp_input:
       target_point = torch.cat((target_point, target_point_next), axis=1)
 
@@ -385,6 +388,8 @@ class LidarCenterNet(nn.Module):
           target_speed_features = joined_checkpoint_features[:, self.config.predict_checkpoint_len]
           if self.config.use_v2x and self.config.use_v2x_aux:
             self._aux_logit = self.hidden_hazard_head(target_speed_features).squeeze(1)
+          if self.config.use_v2x and getattr(self.config, 'use_v2x_aux_reg', 0):
+            self._aux_reg = self.hidden_reg_head(target_speed_features)
 
           pred_checkpoint = self.checkpoint_decoder(gru_features, target_point)
           if self.config.input_path_to_target_speed_network:
@@ -437,7 +442,7 @@ class LidarCenterNet(nn.Module):
                    pred_bounding_box, pred_wp_1, selected_path, waypoint_label, target_speed_label, checkpoint_label,
                    semantic_label, bev_semantic_label, depth_label, center_heatmap_label, wh_label, yaw_class_label,
                    yaw_res_label, offset_label, velocity_label, brake_target_label, pixel_weight_label,
-                   avg_factor_label, sample_weight=None, aux_label=None, aux_mask=None):
+                   avg_factor_label, sample_weight=None, aux_label=None, aux_mask=None, aux_reg_label=None, aux_reg_mask=None):
     loss = {}
     if self.config.use_wp_gru:
       if self.config.multi_wp_output:
@@ -470,6 +475,10 @@ class LidarCenterNet(nn.Module):
       bce = F.binary_cross_entropy_with_logits(self._aux_logit, aux_label, reduction='none')
       m = aux_mask if aux_mask is not None else torch.ones_like(aux_label)
       loss.update({'loss_hidden_hazard': torch.sum(bce * m) / torch.clamp(m.sum(), min=1.0)})
+    if aux_reg_label is not None and getattr(self, '_aux_reg', None) is not None:
+      l1 = torch.abs(self._aux_reg - aux_reg_label).mean(dim=1)
+      m = aux_reg_mask if aux_reg_mask is not None else torch.ones_like(l1)
+      loss.update({'loss_hidden_reg': torch.sum(l1 * m) / torch.clamp(m.sum(), min=1.0)})
 
     if self.config.use_semantic:
       loss_semantic = self.loss_semantic(pred_semantic, semantic_label)
