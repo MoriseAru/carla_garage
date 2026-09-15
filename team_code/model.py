@@ -11,6 +11,7 @@ from aim import AIMBackbone
 from center_net import LidarCenterNetHead
 import cv2
 
+import copy
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -109,6 +110,8 @@ class LidarCenterNet(nn.Module):
           scale_factor_0=self.backbone.perspective_upsample_factor // self.config.deconv_scale_factor_0,
           scale_factor_1=self.backbone.perspective_upsample_factor // self.config.deconv_scale_factor_1)
 
+    self.dual_head = bool(self.config.use_v2x and getattr(self.config, 'v2x_dual_head', 0)
+                          and self.config.transformer_decoder_join and self.config.use_controller_input_prediction)
     if self.config.use_controller_input_prediction:
       if self.config.transformer_decoder_join:
         ts_input_channel = self.config.gru_input_size
@@ -122,6 +125,9 @@ class LidarCenterNet(nn.Module):
       else:
         self.target_speed_network = nn.Sequential(nn.Linear(ts_input_channel, ts_input_channel), nn.ReLU(inplace=True),
                                                   nn.Linear(ts_input_channel, len(config.target_speeds)))
+      if self.dual_head:
+        # scheme D: a separate head for frames where cooperation is available; same architecture, routed by the coop mask
+        self.target_speed_network_coop = copy.deepcopy(self.target_speed_network)
 
     if self.config.use_controller_input_prediction or self.config.use_wp_gru:
       if self.config.transformer_decoder_join:
@@ -300,10 +306,12 @@ class LidarCenterNet(nn.Module):
     tok = self.coop_proj(coop_states) + self.coop_slot_embedding.weight[None, :k]
     return torch.where(coop_mask[..., None] > 0.5, tok, null)
 
-  def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None, coop_states=None, coop_mask=None):
+  def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None, coop_states=None, coop_mask=None,
+              also_sensor_only=False):
     bs = rgb.shape[0]
     self._aux_logit = None   # hidden-hazard auxiliary prediction (scheme C), read by compute_loss
     self._aux_reg = None     # nearest connected hidden hazard state regression (scheme C+)
+    self._ts_sensor = None   # sensor-only target speed from the null-token decoder pass (scheme D), read by compute_loss
     if self.config.two_tp_input:
       target_point = torch.cat((target_point, target_point_next), axis=1)
 
@@ -350,7 +358,10 @@ class LidarCenterNet(nn.Module):
 
       if self.config.transformer_decoder_join:
         fused_features = torch.permute(fused_features, (0, 2, 1))
+        sensor_features = None
         if self.config.use_v2x:  # V2XState plug-in: cooperative vehicle states join the decoder memory
+          if self.dual_head and also_sensor_only:   # same memory with every slot nulled: what the model sees without cooperation
+            sensor_features = torch.cat((fused_features, self.coop_tokens(None, None, bs)), dim=1)
           fused_features = torch.cat((fused_features, self.coop_tokens(coop_states, coop_mask, bs)), dim=1)
         if self.config.use_wp_gru:
           if self.config.multi_wp_output:
@@ -386,6 +397,7 @@ class LidarCenterNet(nn.Module):
 
           gru_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]
           target_speed_features = joined_checkpoint_features[:, self.config.predict_checkpoint_len]
+          has_coop = (coop_mask.sum(1) > 0) if (self.dual_head and coop_mask is not None) else None
           if self.config.use_v2x and self.config.use_v2x_aux:
             self._aux_logit = self.hidden_hazard_head(target_speed_features).squeeze(1)
           if self.config.use_v2x and getattr(self.config, 'use_v2x_aux_reg', 0):
@@ -395,9 +407,22 @@ class LidarCenterNet(nn.Module):
           if self.config.input_path_to_target_speed_network:
             ts_input = torch.cat(
                 (target_speed_features, pred_checkpoint.reshape(bs, self.config.predict_checkpoint_len * 2)), axis=1)
-            pred_target_speed = self.target_speed_network(ts_input)
           else:
-            pred_target_speed = self.target_speed_network(target_speed_features)
+            ts_input = target_speed_features
+          pred_target_speed = self.target_speed_network(ts_input)
+          if self.dual_head:
+            # cooperation available -> cooperative head (free to be token-dependent); otherwise the sensor-only head
+            if has_coop is not None:
+              pred_target_speed = torch.where(has_coop[:, None], self.target_speed_network_coop(ts_input), pred_target_speed)
+            if sensor_features is not None:   # training: the sensor head also sees the frames that did get tokens
+              joined_sensor = self.join(self.checkpoint_query.repeat(bs, 1, 1), sensor_features)
+              if self.config.tp_attention:
+                joined_sensor = joined_sensor[0]
+              ts_feat_sensor = joined_sensor[:, self.config.predict_checkpoint_len]
+              if self.config.input_path_to_target_speed_network:
+                ckpt_sensor = self.checkpoint_decoder(joined_sensor[:, :self.config.predict_checkpoint_len], target_point)
+                ts_feat_sensor = torch.cat((ts_feat_sensor, ckpt_sensor.reshape(bs, self.config.predict_checkpoint_len * 2)), axis=1)
+              self._ts_sensor = self.target_speed_network(ts_feat_sensor)
 
       else:
         joined_features = self.join(fused_features)
@@ -442,7 +467,8 @@ class LidarCenterNet(nn.Module):
                    pred_bounding_box, pred_wp_1, selected_path, waypoint_label, target_speed_label, checkpoint_label,
                    semantic_label, bev_semantic_label, depth_label, center_heatmap_label, wh_label, yaw_class_label,
                    yaw_res_label, offset_label, velocity_label, brake_target_label, pixel_weight_label,
-                   avg_factor_label, sample_weight=None, aux_label=None, aux_mask=None, aux_reg_label=None, aux_reg_mask=None):
+                   avg_factor_label, sample_weight=None, aux_label=None, aux_mask=None, aux_reg_label=None, aux_reg_mask=None,
+                   ts_sensor_mask=None):
     loss = {}
     if self.config.use_wp_gru:
       if self.config.multi_wp_output:
@@ -475,6 +501,10 @@ class LidarCenterNet(nn.Module):
       bce = F.binary_cross_entropy_with_logits(self._aux_logit, aux_label, reduction='none')
       m = aux_mask if aux_mask is not None else torch.ones_like(aux_label)
       loss.update({'loss_hidden_hazard': torch.sum(bce * m) / torch.clamp(m.sum(), min=1.0)})
+    if ts_sensor_mask is not None and getattr(self, '_ts_sensor', None) is not None:
+      per = F.cross_entropy(self._ts_sensor, target_speed_label, weight=self.loss_speed.weight,
+                            label_smoothing=self.loss_speed.label_smoothing, reduction='none')
+      loss.update({'loss_target_speed_sensor': torch.sum(per * ts_sensor_mask) / torch.clamp(ts_sensor_mask.sum(), min=1.0)})
     if aux_reg_label is not None and getattr(self, '_aux_reg', None) is not None:
       l1 = torch.abs(self._aux_reg - aux_reg_label).mean(dim=1)
       m = aux_reg_mask if aux_reg_mask is not None else torch.ones_like(l1)

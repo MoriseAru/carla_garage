@@ -121,6 +121,8 @@ def main():
                       help='Scheme C: extra loss weight on every frame with a connected hidden hazard (1 = off).')
   parser.add_argument('--use_v2x_aux_reg', type=int, default=config.use_v2x_aux_reg,
                       help='Scheme C+: regress the nearest connected hidden hazard state (only knowable from the token).')
+  parser.add_argument('--v2x_dual_head', type=int, default=config.v2x_dual_head,
+                      help='Scheme D: separate target-speed head for frames with cooperation (routed by the coop mask).')
   parser.add_argument('--v2x_hazard_range', type=float, default=config.v2x_hazard_range, help='hazard range ahead (m).')
   parser.add_argument('--use_velocity',
                       type=int,
@@ -846,7 +848,7 @@ class Engine(object):
         lidar = data['lidar'].to(self.device, dtype=torch.float32)
 
       coop_states = coop_mask = None
-      occ_sample_weight = aux_label = aux_mask = aux_reg_label = aux_reg_mask = None
+      occ_sample_weight = aux_label = aux_mask = aux_reg_label = aux_reg_mask = ts_sensor_mask = None
       if self.config.use_v2x:
         coop_states = data['coop_states'].to(self.device, dtype=torch.float32)
         coop_mask = data['coop_mask'].to(self.device, dtype=torch.float32)
@@ -873,6 +875,10 @@ class Engine(object):
           first = torch.argmax(cand, dim=1)                                                                    # first slot with cand == 1 (or 0 if none)
           aux_reg_label = coop_states[torch.arange(coop_states.shape[0], device=self.device), first, :4]
           aux_reg_mask = (cand.sum(1) > 0).float()
+        if getattr(self.config, 'v2x_dual_head', 0) and not validation:
+          # the sensor head is supervised on every frame exactly once: rate-0 frames through the routed output,
+          # token-bearing frames through the second (null-token) decoder pass
+          ts_sensor_mask = (coop_mask.sum(1) > 0).float()
       pred_wp,\
       pred_target_speed,\
       pred_checkpoint,\
@@ -888,7 +894,8 @@ class Engine(object):
                           command=command,
                           target_point_next=target_point_next if self.config.two_tp_input else None,
                           coop_states=coop_states,
-                          coop_mask=coop_mask)
+                          coop_mask=coop_mask,
+                          also_sensor_only=bool(getattr(self.config, 'v2x_dual_head', 0)) and not validation)
     else:
       raise ValueError('The chosen vision backbone does not exist. The options are: transFuser, aim, bev_encoder')
 
@@ -933,7 +940,8 @@ class Engine(object):
                             aux_label=aux_label,
                             aux_mask=aux_mask,
                             aux_reg_label=aux_reg_label,
-                            aux_reg_mask=aux_reg_mask)
+                            aux_reg_mask=aux_reg_mask,
+                            ts_sensor_mask=ts_sensor_mask)
 
     # Compute metrics for logging
     metrics = {}

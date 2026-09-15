@@ -502,6 +502,7 @@ class GlobalConfig:
         'loss_selection': 0.0,
         'loss_hidden_hazard': 1.0,
         'loss_hidden_reg': 1.0,
+        'loss_target_speed_sensor': 1.0,
     }
     self.root_dir = ''
     self.val_towns = []
@@ -831,6 +832,11 @@ class GlobalConfig:
     self.use_v2x_aux = 0           # 1 enables the hidden-hazard auxiliary head (+ 'loss_hidden_hazard')
     self.use_v2x_aux_reg = 0       # 1 adds regression of the nearest connected hidden hazard's [x/32, y/32, vx/10, vy/10] (+ 'loss_hidden_reg');
                                    #   the target is only knowable from the token -> the decoder must read the token states
+    # scheme D (structural): a SECOND target-speed head used only when cooperation is available. Routing is by the coop mask,
+    # which is known at inference, so the cooperative head may become token-dependent (that dependence is what produced the
+    # closed-loop gain) while the sensor-only head keeps base behaviour. Training runs a second decoder pass with all tokens
+    # nulled so the sensor head sees every frame ('loss_target_speed_sensor').
+    self.v2x_dual_head = 0
     self.plant_precision_pos = 7  # 7: 0.5 meters
     self.plant_precision_angle = 4  # 4: 1,875 km/h
     self.plant_precision_speed = 5  # 5: 22.5 degrees
