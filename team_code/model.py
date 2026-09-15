@@ -112,6 +112,9 @@ class LidarCenterNet(nn.Module):
 
     self.dual_head = bool(self.config.use_v2x and getattr(self.config, 'v2x_dual_head', 0)
                           and self.config.transformer_decoder_join and self.config.use_controller_input_prediction)
+    # the tp_attention path appends a target-point token to the decoder memory after the coop tokens; the sensor-only
+    # memory built below would not contain it, so the two passes would differ by more than the coop tokens.
+    assert not (self.dual_head and self.config.tp_attention), 'v2x_dual_head and tp_attention are not supported together'
     if self.config.use_controller_input_prediction:
       if self.config.transformer_decoder_join:
         ts_input_channel = self.config.gru_input_size
