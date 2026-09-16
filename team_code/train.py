@@ -636,6 +636,7 @@ def main():
                                 generator=g_cuda,
                                 num_workers=num_workers,
                                 pin_memory=False,
+                                persistent_workers=num_workers > 0,  # avoid the per-epoch worker respawn storm (D2/D3 died at epoch starts)
                                 drop_last=True)
 
   if args.setting != 'all':
@@ -651,6 +652,7 @@ def main():
                                 generator=g_cuda,
                                 num_workers=num_workers,
                                 pin_memory=False,
+                                persistent_workers=num_workers > 0,  # avoid the per-epoch worker respawn storm (D2/D3 died at epoch starts)
                                 drop_last=True)
   else:
     sampler_val, dataloader_val = None, None
