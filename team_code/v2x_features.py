@@ -85,6 +85,17 @@ def apply_random_rate(states, mask, bucket, p_zero=0.25, generator=None):
     return states, mask * keep, rates
 
 
+def apply_visibility_dropout(states, mask, hidden, keep_visible=0.5, generator=None):
+    """Scheme D3: tokens of vehicles the ego's own sensors already see are dropped at random (kept with prob keep_visible,
+    per slot), tokens of HIDDEN vehicles are never dropped. The cooperative head therefore learns (i) tokens for hidden
+    vehicles are fully reliable -> it may depend on them, which is where the closed-loop gain comes from; (ii) visible
+    vehicles may be missing from the tokens -> it must keep reading them from the sensors, so partial penetration does
+    not blind it to unconnected-but-visible traffic. Returns (states, mask)."""
+    keep = (torch.rand(mask.shape, device=mask.device, generator=generator) < keep_visible).to(mask.dtype)
+    keep = torch.where(hidden > 0.5, torch.ones_like(keep), keep)
+    return states, mask * keep
+
+
 def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius=64.0, relative_transform=None):
     """Closed-loop counterpart. `vehicles` = iterable of (actor_id, actor_matrix(4x4), yaw_rad, speed, length);
     `relative_transform(ego_matrix, actor_matrix)` must be team_code.transfuser_utils.get_relative_transform so the

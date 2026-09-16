@@ -123,6 +123,9 @@ def main():
                       help='Scheme C+: regress the nearest connected hidden hazard state (only knowable from the token).')
   parser.add_argument('--v2x_dual_head', type=int, default=config.v2x_dual_head,
                       help='Scheme D: separate target-speed head for frames with cooperation (routed by the coop mask).')
+  parser.add_argument('--v2x_vis_dropout', type=int, default=config.v2x_vis_dropout,
+                      help='Scheme D3: drop tokens of sensor-visible vehicles at random, never those of hidden vehicles.')
+  parser.add_argument('--v2x_vis_keep', type=float, default=config.v2x_vis_keep, help='Keep probability for visible-vehicle tokens.')
   parser.add_argument('--v2x_hazard_range', type=float, default=config.v2x_hazard_range, help='hazard range ahead (m).')
   parser.add_argument('--use_velocity',
                       type=int,
@@ -852,7 +855,11 @@ class Engine(object):
       if self.config.use_v2x:
         coop_states = data['coop_states'].to(self.device, dtype=torch.float32)
         coop_mask = data['coop_mask'].to(self.device, dtype=torch.float32)
-        if self.config.v2x_rate_dropout and not validation:
+        if getattr(self.config, 'v2x_vis_dropout', 0) and not validation:
+          coop_states, coop_mask = v2x_features.apply_visibility_dropout(coop_states, coop_mask, data['coop_hidden'].to(self.device),
+                                                                          keep_visible=self.config.v2x_vis_keep)
+          rates = torch.ones(coop_mask.shape[0], device=self.device)   # every vehicle is connected; only its token may be withheld
+        elif self.config.v2x_rate_dropout and not validation:
           coop_states, coop_mask, rates = v2x_features.apply_random_rate(coop_states, coop_mask, data['coop_bucket'].to(self.device),
                                                                          p_zero=self.config.v2x_p_zero)
         else:

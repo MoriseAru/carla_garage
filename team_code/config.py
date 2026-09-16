@@ -837,6 +837,10 @@ class GlobalConfig:
     # closed-loop gain) while the sensor-only head keeps base behaviour. Training runs a second decoder pass with all tokens
     # nulled so the sensor head sees every frame ('loss_target_speed_sensor').
     self.v2x_dual_head = 0
+    # scheme D3 (with the dual head): visibility-aware token dropout for the cooperative head -- hidden vehicles always
+    # keep their token, visible ones are kept with prob v2x_vis_keep (see v2x_features.apply_visibility_dropout)
+    self.v2x_vis_dropout = 0
+    self.v2x_vis_keep = 0.5
     self.plant_precision_pos = 7  # 7: 0.5 meters
     self.plant_precision_angle = 4  # 4: 1,875 km/h
     self.plant_precision_speed = 5  # 5: 22.5 degrees

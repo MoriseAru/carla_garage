@@ -15,13 +15,19 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "team_code"))
 import jsonpickle, jsonpickle.ext.numpy as jsonpickle_numpy; jsonpickle_numpy.register_handlers()
 import config as cfgmod, model as modmod, data as datamod, v2x_features
 
-ap = argparse.ArgumentParser(); ap.add_argument("--root", required=True); a = ap.parse_args()
+ap = argparse.ArgumentParser(); ap.add_argument("--root", required=True)
+ap.add_argument("--mode", default="random", choices=["random", "rate1", "vis"],
+                help="random: D (U(0,1] + p_zero); rate1: D2 (coop head at constant rate 1); vis: D3 (visibility-aware token dropout)")
+a = ap.parse_args()
 dev = "cuda" if torch.cuda.is_available() else "cpu"; ok = True
 def check(cond, msg):
     global ok; print(("PASS " if cond else "FAIL ") + msg); ok = ok and bool(cond)
 
 torch.manual_seed(0)
-SET = dict(use_v2x=1, v2x_dual_head=1, v2x_rate_dropout=1, v2x_p_zero=0.25)
+SET = {"random": dict(use_v2x=1, v2x_dual_head=1, v2x_rate_dropout=1, v2x_p_zero=0.25),
+       "rate1":  dict(use_v2x=1, v2x_dual_head=1, v2x_rate_dropout=0, v2x_rate=1.0),
+       "vis":    dict(use_v2x=1, v2x_dual_head=1, v2x_rate_dropout=0, v2x_vis_dropout=1, v2x_vis_keep=0.5)}[a.mode]
+print("mode", a.mode, SET)
 cfg = cfgmod.GlobalConfig(); cfg.initialize(root_dir=[a.root], setting="all", **SET)
 check("loss_target_speed_sensor" in cfg.detailed_loss_weights, "config has loss_target_speed_sensor weight")
 ds = datamod.CARLA_Data(root=cfg.data_roots, config=cfg, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
@@ -93,4 +99,17 @@ net0 = modmod.LidarCenterNet(cfg0).to(dev).eval()
 with torch.no_grad():
     o0 = net0(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, target_point_next=tpn)
 check(not net0.dual_head and len(o0) == 10, "baseline (use_v2x=0) builds a single head and returns the 10-tuple")
+if a.mode == "vis":
+    hid = d["coop_hidden"].to(dev); g = torch.Generator(device=dev).manual_seed(3)
+    keeps = []
+    for _ in range(200):
+        _, m2 = v2x_features.apply_visibility_dropout(st, mk, hid, keep_visible=0.5, generator=g); keeps.append(m2)
+    K = torch.stack(keeps)                                  # (200, bs, K)
+    hidden_valid = (mk > 0) & (hid > 0.5); visible_valid = (mk > 0) & (hid <= 0.5)
+    check(int(hidden_valid.sum()) > 0, f"batch contains hidden vehicles ({int(hidden_valid.sum())} slots)")
+    check(bool((K[:, hidden_valid] == 1).all()), "hidden-vehicle tokens are NEVER dropped")
+    kv = float(K[:, visible_valid].mean()); check(0.4 < kv < 0.6, f"visible-vehicle tokens kept with p ≈ 0.5 (measured {kv:.3f})")
+    check(bool((K <= mk[None]).all()), "dropout never creates tokens (mask only shrinks)")
+if a.mode == "rate1":
+    s1, m1 = v2x_features.apply_rate(st, mk, d["coop_bucket"].to(dev), 1.0); check(torch.equal(m1, mk), "rate 1.0 keeps every valid slot")
 print("DUAL SMOKE PASSED" if ok else "DUAL SMOKE FAILED")
