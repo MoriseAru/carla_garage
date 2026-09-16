@@ -27,6 +27,8 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.distributed.optim import ZeroRedundancyOptimizer
 import torch.multiprocessing as mp
+if os.environ.get('TORCH_SHARING_STRATEGY'):  # e.g. file_system: avoids fd exhaustion with many DataLoader workers
+  mp.set_sharing_strategy(os.environ['TORCH_SHARING_STRATEGY'])
 from diskcache import Cache
 import torchmetrics
 
