@@ -29,9 +29,13 @@ class V2XResidualAdapter(nn.Module):
   initialisation the output equals the input for any tokens; the residual is multiplied by "any valid token" so a frame
   without cooperation (rate 0) is exactly the base model. An always-valid null key keeps the softmax defined."""
 
-  def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512, content_only=False, calib=False, res_gain=False):
+  def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512, content_only=False, calib=False, res_gain=False,
+               aux=False, init_std=0.0):
     super().__init__()
     self.k = k
+    if aux:   # training-only head: regress the nearest connected hidden hazard's state from the adapted target-speed query (dense token signal)
+      self.aux_head = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, 4))
+    self.init_std = float(init_std)
     self.use_res_gain = bool(res_gain)
     if self.use_res_gain:   # unregularised scalar per layer on the token residual (init 1): lets the residual grow without fighting weight decay
       self.res_gain_param = nn.Parameter(torch.ones(num_layers))
@@ -61,10 +65,14 @@ class V2XResidualAdapter(nn.Module):
       layer.ln_f = nn.LayerNorm(d_model)
       layer.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True, bias=not self.content_only)
       layer.mlp = nn.Sequential(nn.Linear(d_model, dim_ff), nn.GELU(), nn.Linear(dim_ff, d_model, bias=not self.content_only))
-      nn.init.zeros_(layer.attn.out_proj.weight)
+      if self.init_std > 0:   # small non-zero start: the token path is active from step 0 (rate 0 still exact via the gate)
+        nn.init.normal_(layer.attn.out_proj.weight, std=self.init_std)
+        nn.init.normal_(layer.mlp[2].weight, std=self.init_std)
+      else:
+        nn.init.zeros_(layer.attn.out_proj.weight)
+        nn.init.zeros_(layer.mlp[2].weight)
       if layer.attn.out_proj.bias is not None:
         nn.init.zeros_(layer.attn.out_proj.bias)
-      nn.init.zeros_(layer.mlp[2].weight)
       if layer.mlp[2].bias is not None:
         nn.init.zeros_(layer.mlp[2].bias)
       self.layers.append(layer)
@@ -256,7 +264,9 @@ class LidarCenterNet(nn.Module):
                                                 dim_ff=getattr(self.config, 'v2x_adapter_ffn', 512),
                                                 content_only=getattr(self.config, 'v2x_adapter_content_only', 0),
                                                 calib=getattr(self.config, 'v2x_adapter_calib', 0),
-                                                res_gain=getattr(self.config, 'v2x_adapter_res_gain', 0))
+                                                res_gain=getattr(self.config, 'v2x_adapter_res_gain', 0),
+                                                aux=getattr(self.config, 'v2x_adapter_aux', 0),
+                                                init_std=getattr(self.config, 'v2x_adapter_init_std', 0.0))
         elif self.config.use_v2x:
           d_model = self.config.gru_input_size
           self.coop_proj = nn.Sequential(nn.Linear(self.config.v2x_state_dim, d_model), nn.ReLU(inplace=True),

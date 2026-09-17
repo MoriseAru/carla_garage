@@ -849,6 +849,8 @@ class GlobalConfig:
     self.v2x_adapter_heads = 8
     self.v2x_adapter_ffn = 512
     self.v2x_adapter_calib = 0          # 1: token-free calibration residual trained first (tokens off) and frozen; rate 0 == base + calib
+    self.v2x_adapter_aux = 0            # 1: training-only aux head (nearest hidden hazard state) inside the adapter
+    self.v2x_adapter_init_std = 0.0     # >0: non-zero init of the residual output projections
     self.v2x_adapter_res_gain = 0       # 1: learnable per-layer scalar gain on the token residual
     self.v2x_adapter_content_only = 0   # 1: residual is a function of token contents only (no null token / slot embedding / biases; MLP on the attention output)
     self.plant_precision_pos = 7  # 7: 0.5 meters

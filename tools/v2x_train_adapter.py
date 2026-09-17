@@ -21,6 +21,8 @@ ap.add_argument("--calib", type=int, default=0, help="1: stage 1 trains a token-
 ap.add_argument("--calib_epochs", type=int, default=3)
 ap.add_argument("--calib_from", default="", help="run dir whose trained calibration stage (v2x_adapter.calib.*) is copied and frozen instead of training stage 1 -> its shuffled-token control stays a valid control")
 ap.add_argument("--res_gain", type=int, default=0, help="learnable per-layer scalar gain on the token residual")
+ap.add_argument("--aux_weight", type=float, default=0.0, help=">0: add aux L1 (nearest connected hidden hazard state from the adapted ts query) x weight")
+ap.add_argument("--init_std", type=float, default=0.0, help=">0: non-zero init of the residual output projections")
 ap.add_argument("--content_only", type=int, default=0, help="adapter residual depends on token contents only (no null token / slot embedding / biases)")
 ap.add_argument("--eval_only", default="", help="run dir of a trained adapter: load it and report metrics (incl. shuffled-token dependence), no training")
 ap.add_argument("--val_frac", type=float, default=0.05); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--max_frames", type=int, default=0)
@@ -55,6 +57,7 @@ else:
     cfg.v2x_adapter_content_only = a.content_only
     cfg.v2x_adapter_calib = a.calib
     cfg.v2x_adapter_res_gain = a.res_gain
+    cfg.v2x_adapter_aux = int(a.aux_weight > 0); cfg.v2x_adapter_init_std = a.init_std; cfg.v2x_adapter_aux_weight = a.aux_weight
     cfg.v2x_adapter_calib_from = a.calib_from
     cfg.v2x_rate = 1.0; cfg.v2x_rate_dropout = int(a.gating == "random"); cfg.v2x_p_zero = a.p_zero; cfg.v2x_vis_dropout = int(a.gating == "vis"); cfg.v2x_vis_keep = a.vis_keep
     cfg.v2x_adapter_tokens = a.tokens; cfg.v2x_adapter_gating = a.gating; cfg.v2x_adapter_base = meta["base_ckpt"]
@@ -159,7 +162,7 @@ if a.calib and not a.eval_only:
 cal_ref = cal_reference(va_idx); print(f"val base+calib (= what rate 0 must reproduce): acc {100*cal_ref['acc']:.2f} occ {100*cal_ref['acc_occ']:.2f} L1 {cal_ref['l1']:.4f}", flush=True)
 for ep in range(a.epochs):
     net.checkpoint_decoder.train()   # cuDNN GRU backward requires train mode (no dropout in it, so the computation is unchanged)
-    perm = tr_idx[torch.randperm(len(tr_idx), device=dev)]; tl = tts = tck = 0.0; t1 = time.time()
+    perm = tr_idx[torch.randperm(len(tr_idx), device=dev)]; tl = tts = tck = taux = 0.0; t1 = time.time()
     for s in range(steps_per_epoch):
         i = perm[s * a.bs:(s + 1) * a.bs]; st, mk = gate(tens["coop_states"][i], tens["coop_mask"][i], tens["coop_bucket"][i], tens["coop_hidden"][i], True)
         q = ad(joined[i].float(), st, mk); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
@@ -167,13 +170,18 @@ for ep in range(a.epochs):
         per_ck = (ck - tens["route"][i]).abs().mean(dim=(1, 2))
         w = torch.ones_like(per_ts) if a.occ_weight == 1.0 else (1.0 + (a.occ_weight - 1.0) * ((mk * tens["coop_hidden"][i] * tens["coop_hazard"][i]).sum(1) > 0).float())
         w = w / w.mean(); loss = w_ts * (per_ts * w).mean() + w_ck * (per_ck * w).mean()
+        if a.aux_weight > 0:   # dense token signal: where is the nearest connected hidden hazard (masked to frames that have one)
+            cand = mk * tens["coop_hidden"][i] * tens["coop_hazard"][i]; has_c = cand.sum(1) > 0
+            first = torch.argmax(cand + 1e-3 * torch.arange(K, 0, -1, device=dev)[None].float() * cand, dim=1)
+            lab_aux = st[torch.arange(len(i), device=dev), first, :4]; pred_aux = ad.aux_head(q[:, L])
+            l_aux = (torch.abs(pred_aux - lab_aux).mean(1) * has_c.float()).sum() / has_c.float().sum().clamp(min=1.0); loss = loss + a.aux_weight * l_aux; taux += float(l_aux)
         opt.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(ad.parameters(), 1.0); opt.step(); sched.step()
         tl += float(loss); tts += float(per_ts.mean()); tck += float(per_ck.mean())
     net.checkpoint_decoder.eval()
     ev = {r: evaluate(va_idx, r) for r in (1.0, 0.5, 0.0)}
     rec = dict(epoch=ep, train_loss=tl / steps_per_epoch, train_ts_ce=tts / steps_per_epoch, train_ckpt_l1=tck / steps_per_epoch, val=ev, lr=sched.get_last_lr()[0], seconds=round(time.time() - t1))
     history.append(rec)
-    show(f"ep {ep:2d} loss {rec['train_loss']:.4f} (ts {rec['train_ts_ce']:.4f}, ck {rec['train_ckpt_l1']:.4f}) {rec['seconds']}s", ev)
+    show(f"ep {ep:2d} loss {rec['train_loss']:.4f} (ts {rec['train_ts_ce']:.4f}, ck {rec['train_ckpt_l1']:.4f}" + (f", aux {taux/steps_per_epoch:.4f}" if a.aux_weight > 0 else "") + f") {rec['seconds']}s", ev)
 assert abs(ev[0.0]["acc"] - base_ref["acc"]) < 1e-6 or a.tokens == "hidden" or True
 with torch.no_grad():
     i = va_idx[:8192]; q = ad.calibrated(joined[i].float()); out = ad(joined[i].float(), tens["coop_states"][i], tens["coop_mask"][i]); rel = (ad.last_delta.norm(dim=-1) / q.norm(dim=-1).clamp(min=1e-6))
