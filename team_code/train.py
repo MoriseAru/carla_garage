@@ -129,6 +129,11 @@ def main():
                       help='Scheme D3: drop tokens of sensor-visible vehicles at random, never those of hidden vehicles.')
   parser.add_argument('--v2x_vis_keep', type=float, default=config.v2x_vis_keep, help='Keep probability for visible-vehicle tokens.')
   parser.add_argument('--v2x_hazard_range', type=float, default=config.v2x_hazard_range, help='hazard range ahead (m).')
+  parser.add_argument('--use_v2x_adapter', type=int, default=config.use_v2x_adapter,
+                      help='Scheme A: frozen-base residual adapter on the planning queries; only v2x_adapter.* is trained.')
+  parser.add_argument('--v2x_adapter_layers', type=int, default=config.v2x_adapter_layers)
+  parser.add_argument('--v2x_adapter_heads', type=int, default=config.v2x_adapter_heads)
+  parser.add_argument('--v2x_adapter_ffn', type=int, default=config.v2x_adapter_ffn)
   parser.add_argument('--use_velocity',
                       type=int,
                       default=config.use_velocity,
@@ -571,6 +576,9 @@ def main():
       start_epoch = int(''.join(filter(str.isdigit, load_name))) + 1
     model.load_state_dict(torch.load(args.load_file, map_location=device), strict=False)
 
+  if getattr(config, 'use_v2x_adapter', 0):   # scheme A: everything but the adapter is the frozen base model
+    for n_, p_ in model.named_parameters():
+      p_.requires_grad_(n_.startswith('v2x_adapter.'))
   if config.freeze_backbone:
     model.backbone.requires_grad_(False)
 

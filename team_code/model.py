@@ -22,6 +22,58 @@ import os
 from nav_planner import LateralPIDController, get_throttle
 
 
+
+class V2XResidualAdapter(nn.Module):
+  """Frozen-base V2XState plug-in (scheme A). The planning queries (checkpoint tokens + target-speed token) read the
+  cooperative-vehicle tokens through cross-attention + MLP residuals whose output projections start at zero, so at
+  initialisation the output equals the input for any tokens; the residual is multiplied by "any valid token" so a frame
+  without cooperation (rate 0) is exactly the base model. An always-valid null key keeps the softmax defined."""
+
+  def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512):
+    super().__init__()
+    self.k = k
+    self.coop_proj = nn.Sequential(nn.Linear(state_dim, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, d_model))
+    self.slot_embed = nn.Embedding(k, d_model)
+    self.null_token = nn.Parameter(torch.zeros(1, 1, d_model))
+    nn.init.normal_(self.null_token, std=0.02)
+    self.layers = nn.ModuleList()
+    for _ in range(num_layers):
+      layer = nn.Module()
+      layer.ln_q = nn.LayerNorm(d_model)
+      layer.ln_f = nn.LayerNorm(d_model)
+      layer.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+      layer.mlp = nn.Sequential(nn.Linear(d_model, dim_ff), nn.GELU(), nn.Linear(dim_ff, d_model))
+      nn.init.zeros_(layer.attn.out_proj.weight)
+      nn.init.zeros_(layer.attn.out_proj.bias)
+      nn.init.zeros_(layer.mlp[2].weight)
+      nn.init.zeros_(layer.mlp[2].bias)
+      self.layers.append(layer)
+    self.last_delta = None   # (bs, Lq, d) residual actually added, for diagnostics
+    self.last_attn = None    # list over layers of (bs, Lq, 1 + K) attention weights when need_weights=True
+
+  def forward(self, queries, coop_states, coop_mask, need_weights=False):
+    if coop_states is None or coop_mask is None:
+      self.last_delta = None
+      return queries
+    bs, k = coop_mask.shape
+    valid = coop_mask > 0.5
+    has = valid.any(dim=1)
+    tok = self.coop_proj(coop_states) + self.slot_embed.weight[None, :k]
+    tok = torch.cat((self.null_token.expand(bs, 1, -1).to(tok.dtype), tok), dim=1)
+    kpm = torch.cat((torch.zeros(bs, 1, dtype=torch.bool, device=coop_mask.device), ~valid), dim=1)
+    x = queries
+    attn = []
+    for layer in self.layers:
+      a, w = layer.attn(layer.ln_q(x), tok, tok, key_padding_mask=kpm, need_weights=need_weights)
+      x = x + a
+      x = x + layer.mlp(layer.ln_f(x))
+      if need_weights:
+        attn.append(w)
+    delta = (x - queries) * has[:, None, None].to(queries.dtype)
+    self.last_delta = delta.detach()
+    self.last_attn = attn if need_weights else None
+    return queries + delta
+
 class LidarCenterNet(nn.Module):
   """
   The main model class. It can run all model configurations.
@@ -115,6 +167,11 @@ class LidarCenterNet(nn.Module):
     # the tp_attention path appends a target-point token to the decoder memory after the coop tokens; the sensor-only
     # memory built below would not contain it, so the two passes would differ by more than the coop tokens.
     assert not (self.dual_head and self.config.tp_attention), 'v2x_dual_head and tp_attention are not supported together'
+    self.v2x_adapter_on = bool(self.config.use_v2x and getattr(self.config, 'use_v2x_adapter', 0)
+                               and self.config.transformer_decoder_join and self.config.use_controller_input_prediction)
+    assert not (self.v2x_adapter_on and (self.dual_head or self.config.tp_attention or getattr(self.config, 'use_v2x_aux', 0)
+                                         or getattr(self.config, 'use_v2x_aux_reg', 0))), \
+        'use_v2x_adapter (frozen-base residual adapter) does not combine with dual_head / tp_attention / aux heads'
     if self.config.use_controller_input_prediction:
       if self.config.transformer_decoder_join:
         ts_input_channel = self.config.gru_input_size
@@ -158,7 +215,13 @@ class LidarCenterNet(nn.Module):
         # We don't have an encoder, so we directly use it on the features
         self.encoder_pos_encoding = PositionEmbeddingSine(self.config.gru_input_size // 2, normalize=True)
         self.extra_sensor_pos_embed = nn.Parameter(torch.zeros(1, self.config.gru_input_size))
-        if self.config.use_v2x:
+        if self.config.use_v2x and self.v2x_adapter_on:
+          # scheme A: memory stays the base's; planning queries get a zero-initialised residual from the coop tokens
+          self.v2x_adapter = V2XResidualAdapter(self.config.gru_input_size, self.config.v2x_state_dim, self.config.v2x_k,
+                                                num_layers=getattr(self.config, 'v2x_adapter_layers', 2),
+                                                num_heads=getattr(self.config, 'v2x_adapter_heads', 8),
+                                                dim_ff=getattr(self.config, 'v2x_adapter_ffn', 512))
+        elif self.config.use_v2x:
           d_model = self.config.gru_input_size
           self.coop_proj = nn.Sequential(nn.Linear(self.config.v2x_state_dim, d_model), nn.ReLU(inplace=True),
                                          nn.Linear(d_model, d_model))
@@ -362,7 +425,7 @@ class LidarCenterNet(nn.Module):
       if self.config.transformer_decoder_join:
         fused_features = torch.permute(fused_features, (0, 2, 1))
         sensor_features = None
-        if self.config.use_v2x:  # V2XState plug-in: cooperative vehicle states join the decoder memory
+        if self.config.use_v2x and not self.v2x_adapter_on:  # V2XState plug-in: cooperative vehicle states join the decoder memory
           if self.dual_head and also_sensor_only:   # same memory with every slot nulled: what the model sees without cooperation
             sensor_features = torch.cat((fused_features, self.coop_tokens(None, None, bs)), dim=1)
           fused_features = torch.cat((fused_features, self.coop_tokens(coop_states, coop_mask, bs)), dim=1)
@@ -397,6 +460,8 @@ class LidarCenterNet(nn.Module):
             attention_weights = [vision_attention.item(), speed_attention.item(), tp_attention.item()]
           else:
             joined_checkpoint_features = self.join(self.checkpoint_query.repeat(bs, 1, 1), fused_features)
+            if self.v2x_adapter_on:   # scheme A: residual read of the coop tokens; identity when no token is valid
+              joined_checkpoint_features = self.v2x_adapter(joined_checkpoint_features, coop_states, coop_mask)
 
           gru_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]
           target_speed_features = joined_checkpoint_features[:, self.config.predict_checkpoint_len]

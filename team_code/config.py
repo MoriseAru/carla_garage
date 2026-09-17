@@ -841,6 +841,13 @@ class GlobalConfig:
     # keep their token, visible ones are kept with prob v2x_vis_keep (see v2x_features.apply_visibility_dropout)
     self.v2x_vis_dropout = 0
     self.v2x_vis_keep = 0.5
+    # Scheme A: frozen-base residual adapter (model.V2XResidualAdapter). The decoder memory stays the base model's; the
+    # planning queries get a zero-initialised cross-attention residual from the cooperative tokens, gated to exactly zero
+    # when no token is valid -> rate 0 is the base model by construction; only v2x_adapter.* is trained.
+    self.use_v2x_adapter = 0
+    self.v2x_adapter_layers = 2
+    self.v2x_adapter_heads = 8
+    self.v2x_adapter_ffn = 512
     self.plant_precision_pos = 7  # 7: 0.5 meters
     self.plant_precision_angle = 4  # 4: 1,875 km/h
     self.plant_precision_speed = 5  # 5: 22.5 degrees
