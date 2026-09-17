@@ -849,6 +849,7 @@ class GlobalConfig:
     self.v2x_adapter_heads = 8
     self.v2x_adapter_ffn = 512
     self.v2x_adapter_calib = 0          # 1: token-free calibration residual trained first (tokens off) and frozen; rate 0 == base + calib
+    self.v2x_adapter_res_gain = 0       # 1: learnable per-layer scalar gain on the token residual
     self.v2x_adapter_content_only = 0   # 1: residual is a function of token contents only (no null token / slot embedding / biases; MLP on the attention output)
     self.plant_precision_pos = 7  # 7: 0.5 meters
     self.plant_precision_angle = 4  # 4: 1,875 km/h

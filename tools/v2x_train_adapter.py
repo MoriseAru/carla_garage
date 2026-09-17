@@ -19,6 +19,8 @@ ap.add_argument("--tokens", choices=["all", "hidden", "shuffle"], default="all",
                 help="hidden: only tokens of vehicles the ego lidar cannot see (train and eval); shuffle: CONTROL - each frame gets another frame's tokens during training")
 ap.add_argument("--calib", type=int, default=0, help="1: stage 1 trains a token-free calibration residual (tokens off) for --calib_epochs, then freezes it")
 ap.add_argument("--calib_epochs", type=int, default=3)
+ap.add_argument("--calib_from", default="", help="run dir whose trained calibration stage (v2x_adapter.calib.*) is copied and frozen instead of training stage 1 -> its shuffled-token control stays a valid control")
+ap.add_argument("--res_gain", type=int, default=0, help="learnable per-layer scalar gain on the token residual")
 ap.add_argument("--content_only", type=int, default=0, help="adapter residual depends on token contents only (no null token / slot embedding / biases)")
 ap.add_argument("--eval_only", default="", help="run dir of a trained adapter: load it and report metrics (incl. shuffled-token dependence), no training")
 ap.add_argument("--val_frac", type=float, default=0.05); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--max_frames", type=int, default=0)
@@ -52,6 +54,8 @@ else:
     cfg = base_cfg(); cfg.use_v2x = 1; cfg.use_v2x_adapter = 1; cfg.v2x_adapter_layers = a.layers; cfg.v2x_adapter_heads = a.heads; cfg.v2x_adapter_ffn = a.ffn
     cfg.v2x_adapter_content_only = a.content_only
     cfg.v2x_adapter_calib = a.calib
+    cfg.v2x_adapter_res_gain = a.res_gain
+    cfg.v2x_adapter_calib_from = a.calib_from
     cfg.v2x_rate = 1.0; cfg.v2x_rate_dropout = int(a.gating == "random"); cfg.v2x_p_zero = a.p_zero; cfg.v2x_vis_dropout = int(a.gating == "vis"); cfg.v2x_vis_keep = a.vis_keep
     cfg.v2x_adapter_tokens = a.tokens; cfg.v2x_adapter_gating = a.gating; cfg.v2x_adapter_base = meta["base_ckpt"]
     net = modmod.LidarCenterNet(cfg); ck_path = meta["base_ckpt"]; res = net.load_state_dict(torch.load(ck_path, map_location="cpu"), strict=False)
@@ -127,7 +131,12 @@ def cal_reference(idx):
             c.append(ts.argmax(1) == lab.argmax(1)); l1.append((ck - tens["route"][i]).abs().mean(dim=(1, 2))); occ.append(occ_all[i])
     c = torch.cat(c).float(); l1 = torch.cat(l1); occ = torch.cat(occ)
     return dict(acc=float(c.mean()), acc_occ=float(c[occ].mean()), l1=float(l1.mean()))
-if a.calib and not a.eval_only:
+if a.calib and a.calib_from and not a.eval_only:
+    src = torch.load(os.path.join(a.calib_from, "model_0030.pth"), map_location="cpu"); cal_sd = {k[len("v2x_adapter.calib."):]: v for k, v in src.items() if k.startswith("v2x_adapter.calib.")}
+    assert cal_sd, "no calib weights in " + a.calib_from; ad.calib.load_state_dict(cal_sd, strict=True)
+    for p_ in ad.calib.parameters(): p_.requires_grad_(False)
+    print(f"calibration stage copied from {a.calib_from} ({len(cal_sd)} tensors) and frozen", flush=True)
+elif a.calib and not a.eval_only:
     cal_params = list(ad.calib.parameters()); opt_c = torch.optim.AdamW(cal_params, lr=a.lr, weight_decay=a.wd, betas=(0.9, 0.98))
     for p_ in ad.parameters(): p_.requires_grad_(False)
     for p_ in cal_params: p_.requires_grad_(True)
@@ -140,6 +149,7 @@ if a.calib and not a.eval_only:
         net.checkpoint_decoder.eval(); cr = cal_reference(va_idx)
         print(f"calib ep {ep} loss {tl/steps_per_epoch:.4f} | base+calib (tokens off): acc {100*cr['acc']:.2f} occ {100*cr['acc_occ']:.2f} L1 {cr['l1']:.4f}", flush=True)
     for p_ in cal_params: p_.requires_grad_(False)
+if a.calib and not a.eval_only:
     for n_, p_ in ad.named_parameters():
         if not n_.startswith("calib."): p_.requires_grad_(True)
     decay = [p for n_, p in ad.named_parameters() if p.requires_grad and p.ndim >= 2 and "ln_" not in n_ and "slot_embed" not in n_ and "null_token" not in n_]
@@ -165,6 +175,9 @@ for ep in range(a.epochs):
     history.append(rec)
     show(f"ep {ep:2d} loss {rec['train_loss']:.4f} (ts {rec['train_ts_ce']:.4f}, ck {rec['train_ckpt_l1']:.4f}) {rec['seconds']}s", ev)
 assert abs(ev[0.0]["acc"] - base_ref["acc"]) < 1e-6 or a.tokens == "hidden" or True
+with torch.no_grad():
+    i = va_idx[:8192]; q = ad.calibrated(joined[i].float()); out = ad(joined[i].float(), tens["coop_states"][i], tens["coop_mask"][i]); rel = (ad.last_delta.norm(dim=-1) / q.norm(dim=-1).clamp(min=1e-6))
+    print(f"token residual |Δ|/|q| on val: mean {float(rel.mean()):.3f}, ts-query {float(rel[:, L].mean()):.3f}, ckpt-queries {float(rel[:, :L].mean()):.3f}" + (f"; res_gain {ad.res_gain_param.detach().cpu().numpy().round(3).tolist()}" if ad.use_res_gain else ""), flush=True)
 print(f"rate-0 check: adapter r0 acc {100*ev[0.0]['acc']:.3f} vs base+calib {100*cal_ref['acc']:.3f} vs base {100*base_ref['acc']:.3f} (r0 must equal base+calib; == base when no calib)", flush=True)
 assert abs(ev[0.0]["acc"] - cal_ref["acc"]) < 1e-4, "rate 0 must equal base + calib"
 # ---------------- export ----------------

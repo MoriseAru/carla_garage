@@ -29,9 +29,12 @@ class V2XResidualAdapter(nn.Module):
   initialisation the output equals the input for any tokens; the residual is multiplied by "any valid token" so a frame
   without cooperation (rate 0) is exactly the base model. An always-valid null key keeps the softmax defined."""
 
-  def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512, content_only=False, calib=False):
+  def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512, content_only=False, calib=False, res_gain=False):
     super().__init__()
     self.k = k
+    self.use_res_gain = bool(res_gain)
+    if self.use_res_gain:   # unregularised scalar per layer on the token residual (init 1): lets the residual grow without fighting weight decay
+      self.res_gain_param = nn.Parameter(torch.ones(num_layers))
     self.content_only = bool(content_only)
     # calib: a token-FREE residual on the planning queries (zero-initialised MLP), trained first with the tokens switched
     # off and then frozen. It absorbs whatever re-calibration of the frozen base the cached frames admit, so the token
@@ -88,13 +91,14 @@ class V2XResidualAdapter(nn.Module):
       kpm = torch.cat((torch.zeros(bs, 1, dtype=torch.bool, device=coop_mask.device), ~valid), dim=1)
     x = queries
     attn = []
-    for layer in self.layers:
+    for li, layer in enumerate(self.layers):
       a, w = layer.attn(layer.ln_q(x), tok, tok, key_padding_mask=kpm, need_weights=need_weights)
+      g = self.res_gain_param[li] if self.use_res_gain else 1.0
       if self.content_only:
-        x = x + a + layer.mlp(layer.ln_f(a))      # everything added is a function of the attended token contents
+        x = x + g * (a + layer.mlp(layer.ln_f(a)))      # everything added is a function of the attended token contents
       else:
-        x = x + a
-        x = x + layer.mlp(layer.ln_f(x))
+        x = x + g * a
+        x = x + g * layer.mlp(layer.ln_f(x))
       if need_weights:
         attn.append(w)
     delta = (x - queries) * has[:, None, None].to(queries.dtype)
@@ -250,7 +254,8 @@ class LidarCenterNet(nn.Module):
                                                 num_heads=getattr(self.config, 'v2x_adapter_heads', 8),
                                                 dim_ff=getattr(self.config, 'v2x_adapter_ffn', 512),
                                                 content_only=getattr(self.config, 'v2x_adapter_content_only', 0),
-                                                calib=getattr(self.config, 'v2x_adapter_calib', 0))
+                                                calib=getattr(self.config, 'v2x_adapter_calib', 0),
+                                                res_gain=getattr(self.config, 'v2x_adapter_res_gain', 0))
         elif self.config.use_v2x:
           d_model = self.config.gru_input_size
           self.coop_proj = nn.Sequential(nn.Linear(self.config.v2x_state_dim, d_model), nn.ReLU(inplace=True),
