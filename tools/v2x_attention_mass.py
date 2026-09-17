@@ -68,11 +68,15 @@ for name, run_dir in runs.items():
                     out = net(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=mk); h.remove()
                     _ = net.v2x_adapter(q_store["joined"], st, mk, need_weights=True); w_layers = net.v2x_adapter.last_attn
                     delta = net.v2x_adapter.last_delta; rel = (delta.norm(dim=-1) / q_store["joined"].norm(dim=-1).clamp(min=1e-6)).mean(1)   # (bs,)
-                    W = torch.stack(w_layers, 0).mean(0)                     # (bs, Lq, 1+K): null first
+                    W = torch.stack(w_layers, 0).mean(0)                     # (bs, Lq, 1+K): null first (K when content_only: no null token)
                     valid = (mk > 0.5).float()
-                    ts_valid = (W[:, L, 1:] * valid).sum(1); ts_null = W[:, L, 0]
-                    ck_valid = (W[:, :L, 1:] * valid[:, None]).sum(-1).mean(1); ck_null = W[:, :L, 0].mean(1)
-                    per_slot = W[:, L, 1:]
+                    if getattr(net.v2x_adapter, "content_only", False):
+                        ts_valid = (W[:, L] * valid).sum(1); ts_null = torch.zeros_like(ts_valid)
+                        ck_valid = (W[:, :L] * valid[:, None]).sum(-1).mean(1); ck_null = torch.zeros_like(ck_valid); per_slot = W[:, L]
+                    else:
+                        ts_valid = (W[:, L, 1:] * valid).sum(1); ts_null = W[:, L, 0]
+                        ck_valid = (W[:, :L, 1:] * valid[:, None]).sum(-1).mean(1); ck_null = W[:, :L, 0].mean(1)
+                        per_slot = W[:, L, 1:]
                 else:
                     W = torch.stack(store, 0).mean(0)                        # (bs, Lq, S): coop tokens are the last K positions
                     valid = (mk > 0.5).float(); Wc = W[:, :, -K:]

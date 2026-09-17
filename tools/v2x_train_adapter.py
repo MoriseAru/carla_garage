@@ -15,7 +15,10 @@ ap.add_argument("--logdir", default="/work/gn21/n21001/carla_garage_runs"); ap.a
 ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--wd", type=float, default=0.01); ap.add_argument("--warmup", type=int, default=500)
 ap.add_argument("--layers", type=int, default=2); ap.add_argument("--heads", type=int, default=8); ap.add_argument("--ffn", type=int, default=512)
 ap.add_argument("--gating", choices=["rate1", "random", "vis"], default="rate1"); ap.add_argument("--p_zero", type=float, default=0.25); ap.add_argument("--vis_keep", type=float, default=0.5)
-ap.add_argument("--tokens", choices=["all", "hidden"], default="all", help="hidden: only tokens of vehicles the ego lidar cannot see (train and eval)")
+ap.add_argument("--tokens", choices=["all", "hidden", "shuffle"], default="all",
+                help="hidden: only tokens of vehicles the ego lidar cannot see (train and eval); shuffle: CONTROL - each frame gets another frame's tokens during training")
+ap.add_argument("--content_only", type=int, default=0, help="adapter residual depends on token contents only (no null token / slot embedding / biases)")
+ap.add_argument("--eval_only", default="", help="run dir of a trained adapter: load it and report metrics (incl. shuffled-token dependence), no training")
 ap.add_argument("--val_frac", type=float, default=0.05); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--max_frames", type=int, default=0)
 ap.add_argument("--occ_weight", type=float, default=1.0, help=">1: up-weight frames with a connected hidden hazard in the loss")
 a = ap.parse_args(); dev = "cuda"; torch.manual_seed(a.seed); np.random.seed(a.seed)
@@ -38,11 +41,18 @@ print(f"frames with a hidden hazard: {100*occ_all.float().mean():.1f}%; expert s
 # ---------------- model ----------------
 def base_cfg():
     cfg = cfgmod.GlobalConfig(); saved = jsonpickle.decode(open(os.path.join(a.base, "config.json")).read()); cfg.__dict__.update(saved.__dict__); return cfg
-cfg = base_cfg(); cfg.use_v2x = 1; cfg.use_v2x_adapter = 1; cfg.v2x_adapter_layers = a.layers; cfg.v2x_adapter_heads = a.heads; cfg.v2x_adapter_ffn = a.ffn
-cfg.v2x_rate = 1.0; cfg.v2x_rate_dropout = int(a.gating == "random"); cfg.v2x_p_zero = a.p_zero; cfg.v2x_vis_dropout = int(a.gating == "vis"); cfg.v2x_vis_keep = a.vis_keep
-cfg.v2x_adapter_tokens = a.tokens; cfg.v2x_adapter_gating = a.gating; cfg.v2x_adapter_base = meta["base_ckpt"]
-net = modmod.LidarCenterNet(cfg); ck_path = meta["base_ckpt"]; res = net.load_state_dict(torch.load(ck_path, map_location="cpu"), strict=False)
-assert not res.unexpected_keys and all(k.startswith("v2x_adapter.") for k in res.missing_keys), res
+if a.eval_only:
+    cfg = cfgmod.GlobalConfig(); cfg.__dict__.update(jsonpickle.decode(open(os.path.join(a.eval_only, "config.json")).read()).__dict__)
+    net = modmod.LidarCenterNet(cfg); net.load_state_dict(torch.load(os.path.join(a.eval_only, "model_0030.pth"), map_location="cpu"), strict=True)
+    ck_path = meta["base_ckpt"]; a.tokens = getattr(cfg, "v2x_adapter_tokens", "all"); a.id = os.path.basename(a.eval_only.rstrip("/")) + "_eval"
+    print(f"eval-only: {a.eval_only} (gating {getattr(cfg, 'v2x_adapter_gating', '?')}, tokens {a.tokens}, content_only {getattr(cfg, 'v2x_adapter_content_only', 0)})", flush=True)
+else:
+    cfg = base_cfg(); cfg.use_v2x = 1; cfg.use_v2x_adapter = 1; cfg.v2x_adapter_layers = a.layers; cfg.v2x_adapter_heads = a.heads; cfg.v2x_adapter_ffn = a.ffn
+    cfg.v2x_adapter_content_only = a.content_only
+    cfg.v2x_rate = 1.0; cfg.v2x_rate_dropout = int(a.gating == "random"); cfg.v2x_p_zero = a.p_zero; cfg.v2x_vis_dropout = int(a.gating == "vis"); cfg.v2x_vis_keep = a.vis_keep
+    cfg.v2x_adapter_tokens = a.tokens; cfg.v2x_adapter_gating = a.gating; cfg.v2x_adapter_base = meta["base_ckpt"]
+    net = modmod.LidarCenterNet(cfg); ck_path = meta["base_ckpt"]; res = net.load_state_dict(torch.load(ck_path, map_location="cpu"), strict=False)
+    assert not res.unexpected_keys and all(k.startswith("v2x_adapter.") for k in res.missing_keys), res
 net.to(dev).eval()   # frozen parts stay in eval; the adapter has no dropout / batch statistics
 for n_, p_ in net.named_parameters(): p_.requires_grad_(n_.startswith("v2x_adapter."))
 ad = net.v2x_adapter; n_ad = sum(p.numel() for p in ad.parameters()); print(f"adapter params {n_ad/1e6:.2f}M; gating={a.gating} tokens={a.tokens}", flush=True)
@@ -57,23 +67,34 @@ print(f"cache check: heads(joined) vs stored base preds: max |Δ logits| {d_ts:.
 
 def gate(st, mk, bk, hid, train):
     if a.tokens == "hidden": mk = mk * hid
+    if a.tokens == "shuffle" and train:   # control: another frame's tokens (content uninformative for this frame, statistics preserved)
+        perm = torch.randperm(st.shape[0], device=st.device); st, mk, hid = st[perm], mk[perm], hid[perm]
+        bk = bk[perm] if bk is not None else None
     if not train: return st, mk
     if a.gating == "random": st, mk, _ = v2x_features.apply_random_rate(st, mk, bk, p_zero=a.p_zero)
     elif a.gating == "vis": st, mk = v2x_features.apply_visibility_dropout(st, mk, hid, keep_visible=a.vis_keep)
     return st, mk
 
 def evaluate(idx, rate):
-    out = {"n": len(idx)}; correct = []; l1 = []; occ = []; slow = []; ce = []
+    """metrics with the frame's own tokens, plus the same frames with SHUFFLED tokens (another frame's set, same rate):
+    the difference is the part of the adapter's effect that depends on token content rather than on token presence."""
+    out = {"n": len(idx)}; correct = []; l1 = []; occ = []; slow = []; ce = []; c_sh = []; l1_sh = []; dlog = []; flip = []
+    g = torch.Generator(device=dev); g.manual_seed(1234)
     with torch.no_grad():
         for s in range(0, len(idx), 4096):
             i = idx[s:s + 4096]; st, mk = tens["coop_states"][i], tens["coop_mask"][i]
             st, mk = v2x_features.apply_rate(st, mk, tens["coop_bucket"][i], rate); st, mk = gate(st, mk, None, tens["coop_hidden"][i], False)
             q = ad(joined[i].float(), st, mk); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
+            perm = torch.randperm(len(i), device=dev, generator=g); q2 = ad(joined[i].float(), st[perm], mk[perm]); ts2, ck2 = heads(q2, tens["target_point"][i])
             correct.append(ts.argmax(1) == lab.argmax(1)); l1.append((ck - tens["route"][i]).abs().mean(dim=(1, 2))); ce.append(F.cross_entropy(ts, lab, reduction="none"))
+            c_sh.append(ts2.argmax(1) == lab.argmax(1)); l1_sh.append((ck2 - tens["route"][i]).abs().mean(dim=(1, 2))); dlog.append((ts - ts2).abs().mean(1)); flip.append(ts.argmax(1) != ts2.argmax(1))
             occ.append(occ_all[i]); slow.append(tens["slowdown"][i] > 0.5)
     c = torch.cat(correct).float(); l1 = torch.cat(l1); occ = torch.cat(occ); slow = torch.cat(slow); ce = torch.cat(ce)
+    c_sh = torch.cat(c_sh).float(); l1_sh = torch.cat(l1_sh); dlog = torch.cat(dlog); flip = torch.cat(flip).float()
     out.update(acc=float(c.mean()), ce=float(ce.mean()), l1=float(l1.mean()), acc_occ=float(c[occ].mean()) if occ.any() else float("nan"), n_occ=int(occ.sum()),
-               acc_occ_slow=float(c[occ & slow].mean()) if (occ & slow).any() else float("nan"), n_occ_slow=int((occ & slow).sum()), acc_slow=float(c[slow].mean()))
+               acc_occ_slow=float(c[occ & slow].mean()) if (occ & slow).any() else float("nan"), n_occ_slow=int((occ & slow).sum()), acc_slow=float(c[slow].mean()),
+               acc_shuffled=float(c_sh.mean()), acc_occ_shuffled=float(c_sh[occ].mean()) if occ.any() else float("nan"), l1_shuffled=float(l1_sh.mean()),
+               dlogit_shuffled=float(dlog.mean()), flip_shuffled=float(flip.mean()))
     return out
 with torch.no_grad():   # base reference on the validation split from the stored predictions
     lab = tens["ts_twohot"][va_idx]; cb = (tens["base_ts"][va_idx].argmax(1) == lab.argmax(1)).float(); ov = occ_all[va_idx]; sv = tens["slowdown"][va_idx] > 0.5
@@ -86,6 +107,14 @@ opt = torch.optim.AdamW([{"params": decay, "weight_decay": a.wd}, {"params": no_
 steps_per_epoch = len(tr_idx) // a.bs; total = steps_per_epoch * a.epochs
 sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / a.warmup) * 0.5 * (1 + math.cos(math.pi * min(1.0, s / max(1, total)))))
 os.makedirs(os.path.join(a.logdir, a.id), exist_ok=True); run_dir = os.path.join(a.logdir, a.id); history = []
+def show(tag, ev):
+    e1, e0 = ev[1.0], ev[0.0]
+    print(f"{tag} | val r1 acc {100*e1['acc']:.2f} occ {100*e1['acc_occ']:.2f} occ&slow {100*e1['acc_occ_slow']:.2f} L1 {e1['l1']:.4f} "
+          f"| r1 SHUFFLED tokens: acc {100*e1['acc_shuffled']:.2f} occ {100*e1['acc_occ_shuffled']:.2f} L1 {e1['l1_shuffled']:.4f} flip {100*e1['flip_shuffled']:.2f}% |Δlogit| {e1['dlogit_shuffled']:.3f} "
+          f"| r0.5 acc {100*ev[0.5]['acc']:.2f} occ {100*ev[0.5]['acc_occ']:.2f} | r0 acc {100*e0['acc']:.2f} occ {100*e0['acc_occ']:.2f}", flush=True)
+if a.eval_only:
+    ev = {r: evaluate(va_idx, r) for r in (1.0, 0.5, 0.0)}; show("EVAL", ev)
+    json.dump(dict(base_ref=base_ref, val=ev), open(os.path.join(a.eval_only, "eval_shuffle.json"), "w"), indent=1); print("ADAPTER_EVAL_DONE"); sys.exit(0)
 for ep in range(a.epochs):
     net.checkpoint_decoder.train()   # cuDNN GRU backward requires train mode (no dropout in it, so the computation is unchanged)
     perm = tr_idx[torch.randperm(len(tr_idx), device=dev)]; tl = tts = tck = 0.0; t1 = time.time()
@@ -102,8 +131,7 @@ for ep in range(a.epochs):
     ev = {r: evaluate(va_idx, r) for r in (1.0, 0.5, 0.0)}
     rec = dict(epoch=ep, train_loss=tl / steps_per_epoch, train_ts_ce=tts / steps_per_epoch, train_ckpt_l1=tck / steps_per_epoch, val=ev, lr=sched.get_last_lr()[0], seconds=round(time.time() - t1))
     history.append(rec)
-    print(f"ep {ep:2d} loss {rec['train_loss']:.4f} (ts {rec['train_ts_ce']:.4f}, ck {rec['train_ckpt_l1']:.4f}) | val r1 acc {100*ev[1.0]['acc']:.2f} occ {100*ev[1.0]['acc_occ']:.2f} occ&slow {100*ev[1.0]['acc_occ_slow']:.2f} L1 {ev[1.0]['l1']:.4f} "
-          f"| r0.5 acc {100*ev[0.5]['acc']:.2f} occ {100*ev[0.5]['acc_occ']:.2f} | r0 acc {100*ev[0.0]['acc']:.2f} occ {100*ev[0.0]['acc_occ']:.2f} | {rec['seconds']}s", flush=True)
+    show(f"ep {ep:2d} loss {rec['train_loss']:.4f} (ts {rec['train_ts_ce']:.4f}, ck {rec['train_ckpt_l1']:.4f}) {rec['seconds']}s", ev)
 assert abs(ev[0.0]["acc"] - base_ref["acc"]) < 1e-6 or a.tokens == "hidden" or True
 print(f"rate-0 check: adapter r0 acc {100*ev[0.0]['acc']:.3f} vs base {100*base_ref['acc']:.3f} (must be identical by construction)", flush=True)
 assert abs(ev[0.0]["acc"] - base_ref["acc"]) < 1e-4, "rate 0 must equal the base model"

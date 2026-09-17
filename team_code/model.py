@@ -29,24 +29,32 @@ class V2XResidualAdapter(nn.Module):
   initialisation the output equals the input for any tokens; the residual is multiplied by "any valid token" so a frame
   without cooperation (rate 0) is exactly the base model. An always-valid null key keeps the softmax defined."""
 
-  def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512):
+  def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512, content_only=False):
     super().__init__()
     self.k = k
-    self.coop_proj = nn.Sequential(nn.Linear(state_dim, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, d_model))
-    self.slot_embed = nn.Embedding(k, d_model)
-    self.null_token = nn.Parameter(torch.zeros(1, 1, d_model))
-    nn.init.normal_(self.null_token, std=0.02)
+    self.content_only = bool(content_only)
+    # content_only: the residual can only be a function of the token CONTENTS -- no null token, no slot embedding, no bias
+    # on the value/output/MLP-output projections, and the MLP acts on the attention output instead of on the queries.
+    # Without it the MLP path (a function of the base features alone) and the always-valid null token let the adapter
+    # learn a token-independent re-calibration of the frozen base (seen 2026-09-17: 90-99% of attention on the null token).
+    self.coop_proj = nn.Sequential(nn.Linear(state_dim, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, d_model, bias=not self.content_only))
+    if not self.content_only:
+      self.slot_embed = nn.Embedding(k, d_model)
+      self.null_token = nn.Parameter(torch.zeros(1, 1, d_model))
+      nn.init.normal_(self.null_token, std=0.02)
     self.layers = nn.ModuleList()
     for _ in range(num_layers):
       layer = nn.Module()
       layer.ln_q = nn.LayerNorm(d_model)
       layer.ln_f = nn.LayerNorm(d_model)
-      layer.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
-      layer.mlp = nn.Sequential(nn.Linear(d_model, dim_ff), nn.GELU(), nn.Linear(dim_ff, d_model))
+      layer.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True, bias=not self.content_only)
+      layer.mlp = nn.Sequential(nn.Linear(d_model, dim_ff), nn.GELU(), nn.Linear(dim_ff, d_model, bias=not self.content_only))
       nn.init.zeros_(layer.attn.out_proj.weight)
-      nn.init.zeros_(layer.attn.out_proj.bias)
+      if layer.attn.out_proj.bias is not None:
+        nn.init.zeros_(layer.attn.out_proj.bias)
       nn.init.zeros_(layer.mlp[2].weight)
-      nn.init.zeros_(layer.mlp[2].bias)
+      if layer.mlp[2].bias is not None:
+        nn.init.zeros_(layer.mlp[2].bias)
       self.layers.append(layer)
     self.last_delta = None   # (bs, Lq, d) residual actually added, for diagnostics
     self.last_attn = None    # list over layers of (bs, Lq, 1 + K) attention weights when need_weights=True
@@ -58,15 +66,23 @@ class V2XResidualAdapter(nn.Module):
     bs, k = coop_mask.shape
     valid = coop_mask > 0.5
     has = valid.any(dim=1)
-    tok = self.coop_proj(coop_states) + self.slot_embed.weight[None, :k]
-    tok = torch.cat((self.null_token.expand(bs, 1, -1).to(tok.dtype), tok), dim=1)
-    kpm = torch.cat((torch.zeros(bs, 1, dtype=torch.bool, device=coop_mask.device), ~valid), dim=1)
+    if self.content_only:
+      tok = self.coop_proj(coop_states)
+      kpm = ~valid
+      kpm[~has, 0] = False   # rows without any valid token attend a dummy slot so the softmax is defined; the gate zeroes them below
+    else:
+      tok = self.coop_proj(coop_states) + self.slot_embed.weight[None, :k]
+      tok = torch.cat((self.null_token.expand(bs, 1, -1).to(tok.dtype), tok), dim=1)
+      kpm = torch.cat((torch.zeros(bs, 1, dtype=torch.bool, device=coop_mask.device), ~valid), dim=1)
     x = queries
     attn = []
     for layer in self.layers:
       a, w = layer.attn(layer.ln_q(x), tok, tok, key_padding_mask=kpm, need_weights=need_weights)
-      x = x + a
-      x = x + layer.mlp(layer.ln_f(x))
+      if self.content_only:
+        x = x + a + layer.mlp(layer.ln_f(a))      # everything added is a function of the attended token contents
+      else:
+        x = x + a
+        x = x + layer.mlp(layer.ln_f(x))
       if need_weights:
         attn.append(w)
     delta = (x - queries) * has[:, None, None].to(queries.dtype)
@@ -220,7 +236,8 @@ class LidarCenterNet(nn.Module):
           self.v2x_adapter = V2XResidualAdapter(self.config.gru_input_size, self.config.v2x_state_dim, self.config.v2x_k,
                                                 num_layers=getattr(self.config, 'v2x_adapter_layers', 2),
                                                 num_heads=getattr(self.config, 'v2x_adapter_heads', 8),
-                                                dim_ff=getattr(self.config, 'v2x_adapter_ffn', 512))
+                                                dim_ff=getattr(self.config, 'v2x_adapter_ffn', 512),
+                                                content_only=getattr(self.config, 'v2x_adapter_content_only', 0))
         elif self.config.use_v2x:
           d_model = self.config.gru_input_size
           self.coop_proj = nn.Sequential(nn.Linear(self.config.v2x_state_dim, d_model), nn.ReLU(inplace=True),
