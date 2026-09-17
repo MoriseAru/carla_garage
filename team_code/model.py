@@ -41,7 +41,8 @@ class V2XResidualAdapter(nn.Module):
     # residual trained afterwards cannot claim it; rate 0 then equals "base + calib" (a V2X-free model) exactly.
     self.use_calib = bool(calib)
     if self.use_calib:
-      self.calib = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, dim_ff), nn.GELU(), nn.Linear(dim_ff, d_model))
+      calib_ff = 512   # fixed so a trained calibration stage can be copied into adapters of any width
+      self.calib = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, calib_ff), nn.GELU(), nn.Linear(calib_ff, d_model))
       nn.init.zeros_(self.calib[3].weight)
       nn.init.zeros_(self.calib[3].bias)
     # content_only: the residual can only be a function of the token CONTENTS -- no null token, no slot embedding, no bias
