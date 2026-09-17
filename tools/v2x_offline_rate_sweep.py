@@ -13,7 +13,9 @@ import jsonpickle, jsonpickle.ext.numpy as jsonpickle_numpy; jsonpickle_numpy.re
 import config as cfgmod, model as modmod, data as datamod, v2x_features
 
 ap = argparse.ArgumentParser(); ap.add_argument("--root", required=True); ap.add_argument("--v2x", required=True); ap.add_argument("--base", required=True)
-ap.add_argument("--n", type=int, default=3000); ap.add_argument("--bs", type=int, default=16); a = ap.parse_args()
+ap.add_argument("--n", type=int, default=3000); ap.add_argument("--bs", type=int, default=16)
+ap.add_argument("--no_aug", type=int, default=0, help="1: un-augmented frames (augment_percentage=0, no colour/lidar aug) - the distribution the adapter cache and closed loop use")
+a = ap.parse_args()
 dev = "cuda"
 
 
@@ -25,6 +27,7 @@ def load(run_dir):
 
 cfg_v, net_v = load(a.v2x); cfg_b, net_b = load(a.base)
 cfg_v.initialize(root_dir=[a.root], setting="all", use_v2x=1)   # dataset with coop states (augmentation kept: identical batch for every condition)
+if a.no_aug: cfg_v.augment_percentage = 0.0; cfg_v.use_color_aug = 0; cfg_v.lidar_aug_prob = 0.0; print("augmentation OFF", flush=True)
 ds = datamod.CARLA_Data(root=cfg_v.data_roots, config=cfg_v, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
 g = torch.Generator().manual_seed(0); idx = torch.randperm(len(ds), generator=g)[: a.n].tolist()
 sub = torch.utils.data.Subset(ds, idx); dl = torch.utils.data.DataLoader(sub, batch_size=a.bs, shuffle=False, num_workers=16)
