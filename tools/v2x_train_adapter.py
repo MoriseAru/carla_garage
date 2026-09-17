@@ -27,6 +27,7 @@ ap.add_argument("--content_only", type=int, default=0, help="adapter residual de
 ap.add_argument("--eval_only", default="", help="run dir of a trained adapter: load it and report metrics (incl. shuffled-token dependence), no training")
 ap.add_argument("--val_frac", type=float, default=0.05); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--max_frames", type=int, default=0)
 ap.add_argument("--occ_weight", type=float, default=1.0, help=">1: up-weight frames with a connected hidden hazard in the loss")
+ap.add_argument("--hard_weight", type=float, default=0.0, help=">0: extra weight on frames where the BASE target-speed prediction is wrong (hard-example mining; the only frames where tokens can change the argmax)")
 a = ap.parse_args(); dev = "cuda"; torch.manual_seed(a.seed); np.random.seed(a.seed)
 
 # ---------------- cache ----------------
@@ -169,6 +170,7 @@ for ep in range(a.epochs):
         per_ts = F.cross_entropy(ts, lab, weight=net.loss_speed.weight, label_smoothing=net.loss_speed.label_smoothing, reduction="none")
         per_ck = (ck - tens["route"][i]).abs().mean(dim=(1, 2))
         w = torch.ones_like(per_ts) if a.occ_weight == 1.0 else (1.0 + (a.occ_weight - 1.0) * ((mk * tens["coop_hidden"][i] * tens["coop_hazard"][i]).sum(1) > 0).float())
+        if a.hard_weight > 0: w = w + a.hard_weight * (tens["base_ts"][i].argmax(1) != lab.argmax(1)).float()
         w = w / w.mean(); loss = w_ts * (per_ts * w).mean() + w_ck * (per_ck * w).mean()
         if a.aux_weight > 0:   # dense token signal: where is the nearest connected hidden hazard (masked to frames that have one)
             cand = mk * tens["coop_hidden"][i] * tens["coop_hazard"][i]; has_c = cand.sum(1) > 0
