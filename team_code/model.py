@@ -29,10 +29,18 @@ class V2XResidualAdapter(nn.Module):
   initialisation the output equals the input for any tokens; the residual is multiplied by "any valid token" so a frame
   without cooperation (rate 0) is exactly the base model. An always-valid null key keeps the softmax defined."""
 
-  def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512, content_only=False):
+  def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512, content_only=False, calib=False):
     super().__init__()
     self.k = k
     self.content_only = bool(content_only)
+    # calib: a token-FREE residual on the planning queries (zero-initialised MLP), trained first with the tokens switched
+    # off and then frozen. It absorbs whatever re-calibration of the frozen base the cached frames admit, so the token
+    # residual trained afterwards cannot claim it; rate 0 then equals "base + calib" (a V2X-free model) exactly.
+    self.use_calib = bool(calib)
+    if self.use_calib:
+      self.calib = nn.Sequential(nn.LayerNorm(d_model), nn.Linear(d_model, dim_ff), nn.GELU(), nn.Linear(dim_ff, d_model))
+      nn.init.zeros_(self.calib[3].weight)
+      nn.init.zeros_(self.calib[3].bias)
     # content_only: the residual can only be a function of the token CONTENTS -- no null token, no slot embedding, no bias
     # on the value/output/MLP-output projections, and the MLP acts on the attention output instead of on the queries.
     # Without it the MLP path (a function of the base features alone) and the always-valid null token let the adapter
@@ -59,7 +67,11 @@ class V2XResidualAdapter(nn.Module):
     self.last_delta = None   # (bs, Lq, d) residual actually added, for diagnostics
     self.last_attn = None    # list over layers of (bs, Lq, 1 + K) attention weights when need_weights=True
 
+  def calibrated(self, queries):
+    return queries + self.calib(queries) if self.use_calib else queries
+
   def forward(self, queries, coop_states, coop_mask, need_weights=False):
+    queries = self.calibrated(queries)   # token-free part (identity unless calib)
     if coop_states is None or coop_mask is None:
       self.last_delta = None
       return queries
@@ -237,7 +249,8 @@ class LidarCenterNet(nn.Module):
                                                 num_layers=getattr(self.config, 'v2x_adapter_layers', 2),
                                                 num_heads=getattr(self.config, 'v2x_adapter_heads', 8),
                                                 dim_ff=getattr(self.config, 'v2x_adapter_ffn', 512),
-                                                content_only=getattr(self.config, 'v2x_adapter_content_only', 0))
+                                                content_only=getattr(self.config, 'v2x_adapter_content_only', 0),
+                                                calib=getattr(self.config, 'v2x_adapter_calib', 0))
         elif self.config.use_v2x:
           d_model = self.config.gru_input_size
           self.coop_proj = nn.Sequential(nn.Linear(self.config.v2x_state_dim, d_model), nn.ReLU(inplace=True),
