@@ -96,12 +96,44 @@ def apply_visibility_dropout(states, mask, hidden, keep_visible=0.5, generator=N
     return states, mask * keep
 
 
-def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius=64.0, relative_transform=None):
-    """Closed-loop counterpart. `vehicles` = iterable of (actor_id, actor_matrix(4x4), yaw_rad, speed, length);
+def points_in_box(rel_pos, rel_yaw, extent, lidar):
+    """Ego-lidar hits inside a vehicle's box. Same computation as data_agent.get_points_in_bbox (the recorded
+    `num_points`): `rel_pos` (3,) and `rel_yaw` are the vehicle's pose in the ego frame, `lidar` (N,3) ego-frame points."""
+    if lidar is None or len(lidar) == 0:
+        return -1
+    c, s = math.cos(rel_yaw), math.sin(rel_yaw)
+    rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
+    v = (rot.T @ (np.asarray(lidar, dtype=np.float64)[:, :3] - np.asarray(rel_pos, dtype=np.float64)).T).T
+    x, y, z = float(extent[0]), float(extent[1]), float(extent[2])
+    return int(((v[:, 0] < x) & (v[:, 0] > -x) & (v[:, 1] < y) & (v[:, 1] > -y) & (v[:, 2] < z) & (v[:, 2] > -z)).sum())
+
+
+def select_delayed(history, latency_frames):
+    """`history` = per-actor deque of per-frame records (newest last). Returns the record `latency_frames` frames old, or
+    None if the message has not "arrived" yet (fewer records than the latency)."""
+    if latency_frames <= 0:
+        return history[-1] if len(history) else None
+    idx = len(history) - 1 - int(latency_frames)
+    return history[idx] if idx >= 0 else None
+
+
+def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius=64.0, relative_transform=None,
+                           lidar=None, hidden_pts=5, tokens="all", pos_noise=0.0, vel_noise=0.0, drop=0.0, rng=None, stats=None):
+    """Closed-loop counterpart. `vehicles` = iterable of (actor_id, actor_matrix(4x4), yaw_rad, speed, length[, extent(3,)]);
     `relative_transform(ego_matrix, actor_matrix)` must be team_code.transfuser_utils.get_relative_transform so the
-    frame matches the recorded boxes exactly. Returns torch tensors (1,k,7), (1,k)."""
+    frame matches the recorded boxes exactly. Returns torch tensors (1,k,7), (1,k).
+    Inference-time message model (all default to the training condition):
+      tokens: 'all' | 'hidden' (only vehicles with <= hidden_pts ego-lidar hits in their box, needs `lidar` + extents)
+              | 'visible' (the complement) -- does the gain come from vehicles the ego cannot see?
+      pos_noise / vel_noise: Gaussian noise (m, m/s) on the reported position / speed;  drop: per-message loss probability.
+    `stats` (dict) receives counts: total, in_radius, hidden, kept."""
+    rng = rng if rng is not None else np.random.default_rng()
     cands = []
-    for aid, mat, yaw, spd, length in vehicles:
+    st = dict(total=0, in_radius=0, hidden=0, kept=0, dropped=0)
+    for veh in vehicles:
+        aid, mat, yaw, spd, length = veh[:5]
+        extent = veh[5] if len(veh) > 5 else (length / 2.0, 1.0, 0.8)
+        st["total"] += 1
         if rate < 1.0 and bucket_of(aid) >= int(rate * BUCKETS):
             continue
         rel = relative_transform(ego_matrix, mat)
@@ -109,11 +141,27 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
         dist = math.hypot(x, y)
         if dist > radius:
             continue
+        st["in_radius"] += 1
         ryaw = math.atan2(math.sin(yaw - ego_yaw), math.cos(yaw - ego_yaw))
-        cands.append((dist, _state(x, y, ryaw, float(spd), float(length))))
+        if tokens != "all":
+            n = points_in_box(np.asarray(rel[:3], dtype=np.float64), ryaw, extent, lidar)
+            hid = (0 <= n <= hidden_pts)
+            st["hidden"] += int(hid)
+            if (tokens == "hidden" and not hid) or (tokens == "visible" and hid):
+                continue
+        if drop > 0.0 and rng.random() < drop:
+            st["dropped"] += 1
+            continue
+        if pos_noise > 0.0:
+            x += float(rng.normal(0.0, pos_noise)); y += float(rng.normal(0.0, pos_noise))
+        spd = float(spd) + (float(rng.normal(0.0, vel_noise)) if vel_noise > 0.0 else 0.0)
+        cands.append((dist, _state(x, y, ryaw, max(0.0, spd), float(length))))
     cands.sort(key=lambda t: t[0])
     states = np.zeros((k, STATE_DIM), dtype=np.float32)
     mask = np.zeros((k,), dtype=np.float32)
     for j, (_, vec) in enumerate(cands[:k]):
         states[j], mask[j] = vec, 1.0
+    st["kept"] = int(mask.sum())
+    if stats is not None:
+        stats.update(st)
     return torch.from_numpy(states)[None], torch.from_numpy(mask)[None]

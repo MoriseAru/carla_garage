@@ -272,26 +272,59 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self._route_planner.set_route(self._global_plan, True)
     self.initialized = True
 
-  def v2x_states(self):
-    """States of the connected vehicles (hash-gated penetration V2X_RATE, default config.v2x_rate) in the ego frame,
-    using the same relative transform as the recorded training boxes."""
+  def v2x_states(self, lidar=None):
+    """States of the connected vehicles in the ego frame, using the same relative transform as the recorded training boxes.
+    Inference-time message model, all via environment variables (defaults = training condition):
+      V2X_RATE            penetration (hash-gated per actor id; default config.v2x_rate)
+      V2X_TOKENS          all | hidden | visible   (hidden = <= V2X_HIDDEN_PTS ego-lidar hits in the vehicle's box, default 5)
+      V2X_POS_NOISE       Gaussian position noise on the reported state (m);  V2X_VEL_NOISE (m/s)
+      V2X_DROP            per-message loss probability per frame
+      V2X_LATENCY_FRAMES  use each vehicle's state from N frames ago (20 Hz -> 4 frames = 200 ms); not yet received -> no token
+      V2X_SEED            seed of the noise / drop generator (default 0)"""
     from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  # pylint: disable=import-outside-toplevel
     ego = CarlaDataProvider.get_hero_actor()
     ego_tf = ego.get_transform()
     ego_matrix = np.array(ego_tf.get_matrix())
     ego_yaw = np.deg2rad(ego_tf.rotation.yaw)
-    vehicles = []
+    env = os.environ
+    latency = int(env.get('V2X_LATENCY_FRAMES', 0))
+    if not hasattr(self, 'v2x_hist'):
+      self.v2x_hist = {}
+      self.v2x_rng = np.random.default_rng(int(env.get('V2X_SEED', 0)))
+    live = {}
     for actor in CarlaDataProvider.get_all_actors().filter('vehicle.*'):
       if actor.id == ego.id:
         continue
       tf = actor.get_transform()
       vel = actor.get_velocity()
-      vehicles.append((actor.id, np.array(tf.get_matrix()), np.deg2rad(tf.rotation.yaw),
-                       math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2), 2.0 * actor.bounding_box.extent.x))
-    rate = float(os.environ.get('V2X_RATE', self.config.v2x_rate))
-    states, mask = v2x_features.coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=self.config.v2x_k, rate=rate,
-                                                       radius=self.config.v2x_radius,
-                                                       relative_transform=t_u.get_relative_transform)
+      ext = actor.bounding_box.extent
+      live[actor.id] = (actor.id, np.array(tf.get_matrix()), np.deg2rad(tf.rotation.yaw),
+                        math.sqrt(vel.x ** 2 + vel.y ** 2 + vel.z ** 2), 2.0 * ext.x, (ext.x, ext.y, ext.z))
+    vehicles = []
+    if latency > 0:   # each vehicle's message arrives `latency` frames late; the ego pose used for the transform is current
+      for aid, rec in live.items():
+        self.v2x_hist.setdefault(aid, deque(maxlen=latency + 1)).append(rec)
+      for aid in list(self.v2x_hist):
+        if aid not in live:
+          del self.v2x_hist[aid]
+      for aid, hist in self.v2x_hist.items():
+        rec = v2x_features.select_delayed(hist, latency)
+        if rec is not None:
+          vehicles.append(rec)
+    else:
+      vehicles = list(live.values())
+    rate = float(env.get('V2X_RATE', self.config.v2x_rate))
+    stats = {}
+    states, mask = v2x_features.coop_states_from_world(
+        ego_matrix, ego_yaw, vehicles, k=self.config.v2x_k, rate=rate, radius=self.config.v2x_radius,
+        relative_transform=t_u.get_relative_transform, lidar=lidar,
+        hidden_pts=int(env.get('V2X_HIDDEN_PTS', getattr(self.config, 'v2x_hidden_pts', 5))), tokens=env.get('V2X_TOKENS', 'all'),
+        pos_noise=float(env.get('V2X_POS_NOISE', 0.0)), vel_noise=float(env.get('V2X_VEL_NOISE', 0.0)),
+        drop=float(env.get('V2X_DROP', 0.0)), rng=self.v2x_rng, stats=stats)
+    if self.step % 200 == 0:
+      print(f"v2x step {self.step}: rate={rate} tokens={env.get('V2X_TOKENS', 'all')} latency={latency} "
+            f"noise={env.get('V2X_POS_NOISE', 0)}/{env.get('V2X_VEL_NOISE', 0)} drop={env.get('V2X_DROP', 0)} | "
+            f"vehicles {stats.get('total')} in-radius {stats.get('in_radius')} hidden {stats.get('hidden')} kept {stats.get('kept')}", flush=True)
     return states.to(self.device), mask.to(self.device)
 
   def sensors(self):
@@ -532,7 +565,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     # V2XState plug-in: connected vehicles' ground-truth states from the simulator (privileged, by design of the premise)
     coop_states = coop_mask = None
     if getattr(self.config, 'use_v2x', 0):
-      coop_states, coop_mask = self.v2x_states()
+      coop_states, coop_mask = self.v2x_states(lidar=tick_data.get('lidar'))   # ego-frame lidar for the hidden/visible filter
 
     # forward pass
     pred_wps = []
