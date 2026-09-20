@@ -13,7 +13,10 @@ import config as cfgmod, model as modmod, data as datamod, v2x_features
 
 ap = argparse.ArgumentParser(); ap.add_argument("--root", required=True); ap.add_argument("--runs", required=True, nargs="+", help="name=run_dir ... (space separated: PBS -v splits on commas)")
 ap.add_argument("--n", type=int, default=2000); ap.add_argument("--bs", type=int, default=16); ap.add_argument("--rates", default="1.0 0.5")
-ap.add_argument("--out", default="/work/gn21/n21001/V2XState_Real/tmp/v2x_attention_mass.json"); a = ap.parse_args(); dev = "cuda"
+ap.add_argument("--out", default="/work/gn21/n21001/V2XState_Real/tmp/v2x_attention_mass.json")
+ap.add_argument("--tokens", default="all", choices=["all", "hidden", "visible"],
+                help="offline counterpart of V2X_TOKENS: restrict the token set to the vehicles the ego lidar cannot / can see")
+a = ap.parse_args(); dev = "cuda"
 runs = dict(kv.split("=") for kv in a.runs); rates = [float(r) for r in a.rates.split()]
 
 def load(run_dir):
@@ -26,7 +29,7 @@ cfg0.initialize(root_dir=[a.root], setting="all", use_v2x=1)
 ds = datamod.CARLA_Data(root=cfg0.data_roots, config=cfg0, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
 g = torch.Generator().manual_seed(0); idx = torch.randperm(len(ds), generator=g)[: a.n].tolist()
 dl = torch.utils.data.DataLoader(torch.utils.data.Subset(ds, idx), batch_size=a.bs, shuffle=False, num_workers=16)
-print(f"frames {len(idx)}; runs {list(runs)}; rates {rates}", flush=True)
+print(f"frames {len(idx)}; runs {list(runs)}; rates {rates}; token subset {a.tokens}", flush=True)
 L = cfg0.predict_checkpoint_len; K = cfg0.v2x_k
 batches = []   # cache the batches so every run sees identical frames
 for data in dl: batches.append({k: data[k] for k in ("rgb", "lidar", "target_point", "speed", "command", "coop_states", "coop_mask", "coop_bucket", "coop_hidden", "coop_hazard", "target_speed_twohot")})
@@ -55,6 +58,8 @@ for name, run_dir in runs.items():
             st = data["coop_states"].to(dev, dtype=torch.float32); mk0 = data["coop_mask"].to(dev, dtype=torch.float32); bk = data["coop_bucket"].to(dev)
             hid = data["coop_hidden"].to(dev, dtype=torch.float32); haz = data["coop_hazard"].to(dev, dtype=torch.float32)
             st, mk = v2x_features.apply_rate(st, mk0, bk, rate); bs = rgb.shape[0]
+            if a.tokens == "hidden": mk = mk * hid            # only vehicles with <= v2x_hidden_pts lidar points
+            elif a.tokens == "visible": mk = mk * (1.0 - hid)
             occ = ((mk * hid * haz).sum(1) > 0)
             ts_label = data["target_speed_twohot"].to(dev).argmax(1)
             with torch.no_grad():

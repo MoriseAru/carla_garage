@@ -96,6 +96,29 @@ def apply_visibility_dropout(states, mask, hidden, keep_visible=0.5, generator=N
     return states, mask * keep
 
 
+def rotation_angle(track_id, salt=0):
+    """Deterministic angle in [0, 2pi) for one actor: the same vehicle gets the same rotation for the whole route, so a
+    randomised token set is temporally coherent (a ghost car driving a rotated trajectory) instead of flickering noise."""
+    return 2.0 * math.pi * (zlib.crc32(f"{track_id}:{salt}".encode("utf-8")) / 2 ** 32)
+
+
+def rotate_about_ego(x, y, yaw, angle):
+    """Rotate a reported state rigidly about the ego. Distance, speed and size are preserved; only WHERE the vehicle is
+    (and which way it points) becomes wrong -- the control for 'does the content of this message matter, or just its
+    presence?'."""
+    c, s = math.cos(angle), math.sin(angle)
+    return c * x - s * y, s * x + c * y, math.atan2(math.sin(yaw + angle), math.cos(yaw + angle))
+
+
+def route_use_base(history, thresh):
+    """Availability router: True = fall back to the V2X-free base model. `history` is a deque of per-frame
+    kept/in_radius ratios (frames with no vehicle in radius contribute nothing). Undecidable (empty history) -> False,
+    i.e. keep using the plug-in. Averaging over the window keeps the decision from flapping frame to frame."""
+    if thresh <= 0.0 or not len(history):
+        return False
+    return (sum(history) / len(history)) < thresh
+
+
 def points_in_box(rel_pos, rel_yaw, extent, lidar):
     """Ego-lidar hits inside a vehicle's box. Same computation as data_agent.get_points_in_bbox (the recorded
     `num_points`): `rel_pos` (3,) and `rel_yaw` are the vehicle's pose in the ego frame, `lidar` (N,3) ego-frame points."""
@@ -118,7 +141,8 @@ def select_delayed(history, latency_frames):
 
 
 def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius=64.0, relative_transform=None,
-                           lidar=None, hidden_pts=5, tokens="all", pos_noise=0.0, vel_noise=0.0, drop=0.0, rng=None, stats=None):
+                           lidar=None, hidden_pts=5, tokens="all", pos_noise=0.0, vel_noise=0.0, drop=0.0, rng=None,
+                           randomize="none", salt=0, stats=None):
     """Closed-loop counterpart. `vehicles` = iterable of (actor_id, actor_matrix(4x4), yaw_rad, speed, length[, extent(3,)]);
     `relative_transform(ego_matrix, actor_matrix)` must be team_code.transfuser_utils.get_relative_transform so the
     frame matches the recorded boxes exactly. Returns torch tensors (1,k,7), (1,k).
@@ -126,10 +150,15 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
       tokens: 'all' | 'hidden' (only vehicles with <= hidden_pts ego-lidar hits in their box, needs `lidar` + extents)
               | 'visible' (the complement) -- does the gain come from vehicles the ego cannot see?
       pos_noise / vel_noise: Gaussian noise (m, m/s) on the reported position / speed;  drop: per-message loss probability.
-    `stats` (dict) receives counts: total, in_radius, hidden, kept."""
+      randomize: 'none' | 'all' | 'hidden' | 'visible' -- that subset keeps its token (count, distance, speed and size
+              unchanged) but is rigidly rotated about the ego by a per-actor constant angle, so the message is present
+              and plausible but no longer describes where the vehicle actually is. Separates 'the content of this
+              message matters' from 'a token being there matters'.
+    `stats` (dict) receives counts: total, in_radius, hidden, kept, dropped, randomized."""
     rng = rng if rng is not None else np.random.default_rng()
     cands = []
-    st = dict(total=0, in_radius=0, hidden=0, kept=0, dropped=0)
+    st = dict(total=0, in_radius=0, hidden=0, kept=0, dropped=0, randomized=0)
+    need_vis = (tokens != "all") or (randomize in ("hidden", "visible"))
     for veh in vehicles:
         aid, mat, yaw, spd, length = veh[:5]
         extent = veh[5] if len(veh) > 5 else (length / 2.0, 1.0, 0.8)
@@ -143,7 +172,8 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
             continue
         st["in_radius"] += 1
         ryaw = math.atan2(math.sin(yaw - ego_yaw), math.cos(yaw - ego_yaw))
-        if tokens != "all":
+        hid = False
+        if need_vis:
             n = points_in_box(np.asarray(rel[:3], dtype=np.float64), ryaw, extent, lidar)
             hid = (0 <= n <= hidden_pts)
             st["hidden"] += int(hid)
@@ -152,6 +182,9 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
         if drop > 0.0 and rng.random() < drop:
             st["dropped"] += 1
             continue
+        if randomize != "none" and (randomize == "all" or (randomize == "hidden") == hid):
+            x, y, ryaw = rotate_about_ego(x, y, ryaw, rotation_angle(aid, salt))
+            st["randomized"] += 1
         if pos_noise > 0.0:
             x += float(rng.normal(0.0, pos_noise)); y += float(rng.normal(0.0, pos_noise))
         spd = float(spd) + (float(rng.normal(0.0, vel_noise)) if vel_noise > 0.0 else 0.0)

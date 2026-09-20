@@ -153,6 +153,34 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
         self.nets.append(net)
 
+    # Availability router (V2X_ROUTE_THRESH > 0): a second, V2X-free model that takes over on frames where too few of
+    # the surrounding vehicles are sending state. Deployment form of "graceful degradation" -- no retraining involved.
+    self.base_nets = []
+    self.route_thresh = float(os.environ.get('V2X_ROUTE_THRESH', 0.0))
+    self.route_window = int(os.environ.get('V2X_ROUTE_WINDOW', 20))
+    self.v2x_avail = deque(maxlen=self.route_window)
+    self.route_to_base = False
+    self.route_base_frames = 0
+    base_ckpt = os.environ.get('V2X_BASE_CKPT', '')
+    if self.route_thresh > 0.0 and base_ckpt:
+      with open(os.path.join(base_ckpt, 'config.json'), 'rt', encoding='utf-8') as f:
+        base_cfg = GlobalConfig()
+        base_cfg.__dict__.update(jsonpickle.decode(f.read()).__dict__)
+      for k in ('inference_direct_controller', 'brake_uncertainty_threshold', 'debug'):   # the env-driven overrides setup applies above
+        setattr(base_cfg, k, getattr(self.config, k))
+      assert not getattr(base_cfg, 'use_v2x', 0), 'V2X_BASE_CKPT must be a V2X-free model (use_v2x=0)'
+      for file in sorted(os.listdir(base_ckpt)):
+        if file.endswith('.pth') and file.startswith('model'):
+          net = LidarCenterNet(base_cfg)
+          if base_cfg.sync_batch_norm:
+            net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(net)
+          net.load_state_dict(torch.load(os.path.join(base_ckpt, file), map_location=self.device), strict=True)
+          net.cuda(device=self.device)
+          net.eval()
+          self.base_nets.append(net)
+      assert len(self.base_nets) == 1, f'expected exactly one model_*.pth in {base_ckpt}, found {len(self.base_nets)}'
+      print(f'V2X availability router ON: base={base_ckpt} thresh={self.route_thresh} window={self.route_window}')
+
     self.stuck_detector = 0
     self.force_move = 0
 
@@ -280,7 +308,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       V2X_POS_NOISE       Gaussian position noise on the reported state (m);  V2X_VEL_NOISE (m/s)
       V2X_DROP            per-message loss probability per frame
       V2X_LATENCY_FRAMES  use each vehicle's state from N frames ago (20 Hz -> 4 frames = 200 ms); not yet received -> no token
-      V2X_SEED            seed of the noise / drop generator (default 0)"""
+      V2X_RANDOMIZE       none | all | hidden | visible: that subset keeps its token but is rotated about the ego by a
+                          per-actor constant angle (present and plausible, but not where the vehicle is)
+      V2X_SEED            seed of the noise / drop generator and of the randomisation angles (default 0)"""
     from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  # pylint: disable=import-outside-toplevel
     ego = CarlaDataProvider.get_hero_actor()
     ego_tf = ego.get_transform()
@@ -320,11 +350,19 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         relative_transform=t_u.get_relative_transform, lidar=lidar,
         hidden_pts=int(env.get('V2X_HIDDEN_PTS', getattr(self.config, 'v2x_hidden_pts', 5))), tokens=env.get('V2X_TOKENS', 'all'),
         pos_noise=float(env.get('V2X_POS_NOISE', 0.0)), vel_noise=float(env.get('V2X_VEL_NOISE', 0.0)),
-        drop=float(env.get('V2X_DROP', 0.0)), rng=self.v2x_rng, stats=stats)
+        drop=float(env.get('V2X_DROP', 0.0)), rng=self.v2x_rng,
+        randomize=env.get('V2X_RANDOMIZE', 'none'), salt=int(env.get('V2X_SEED', 0)), stats=stats)
+    self.v2x_stats = stats
+    if stats.get('in_radius', 0) > 0:      # availability signal for the router; frames with no vehicle in radius say nothing
+      self.v2x_avail.append(stats['kept'] / stats['in_radius'])
     if self.step % 200 == 0:
-      print(f"v2x step {self.step}: rate={rate} tokens={env.get('V2X_TOKENS', 'all')} latency={latency} "
-            f"noise={env.get('V2X_POS_NOISE', 0)}/{env.get('V2X_VEL_NOISE', 0)} drop={env.get('V2X_DROP', 0)} | "
-            f"vehicles {stats.get('total')} in-radius {stats.get('in_radius')} hidden {stats.get('hidden')} kept {stats.get('kept')}", flush=True)
+      print(f"v2x step {self.step}: rate={rate} tokens={env.get('V2X_TOKENS', 'all')} randomize={env.get('V2X_RANDOMIZE', 'none')} "
+            f"latency={latency} noise={env.get('V2X_POS_NOISE', 0)}/{env.get('V2X_VEL_NOISE', 0)} drop={env.get('V2X_DROP', 0)} | "
+            f"vehicles {stats.get('total')} in-radius {stats.get('in_radius')} hidden {stats.get('hidden')} "
+            f"kept {stats.get('kept')} randomized {stats.get('randomized')}"
+            + (f" | router: avail {sum(self.v2x_avail)/max(len(self.v2x_avail),1):.2f} thresh {self.route_thresh} "
+               f"-> {'BASE' if self.route_to_base else 'plug-in'} (base frames {self.route_base_frames}/{self.step + 1})"
+               if self.base_nets else ""), flush=True)
     return states.to(self.device), mask.to(self.device)
 
   def sensors(self):
@@ -567,13 +605,21 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if getattr(self.config, 'use_v2x', 0):
       coop_states, coop_mask = self.v2x_states(lidar=tick_data.get('lidar'))   # ego-frame lidar for the hidden/visible filter
 
+    # availability router: on frames where too few vehicles are sending, run the V2X-free base model instead
+    nets = self.nets
+    if self.base_nets:
+      self.route_to_base = v2x_features.route_use_base(self.v2x_avail, self.route_thresh)
+      if self.route_to_base:
+        nets = self.base_nets
+        self.route_base_frames += 1
+
     # forward pass
     pred_wps = []
     pred_target_speeds = []
     pred_checkpoints = []
     bounding_boxes = []
     wp_selected = None
-    for i in range(self.model_count):
+    for i in range(len(nets)):
       if self.config.backbone in ('transFuser', 'aim', 'bev_encoder'):
         pred_wp, \
         pred_target_speed, \
@@ -584,7 +630,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         pred_bb_features,\
         attention_weights,\
         pred_wp_1,\
-        selected_path = self.nets[i].forward(
+        selected_path = nets[i].forward(
           rgb=tick_data['rgb'],
           lidar_bev=lidar_bev,
           target_point=tick_data['target_point'],
@@ -596,7 +642,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         # Only convert bounding boxes when they are used.
         if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
                                          self.stop_sign_controller):
-          pred_bounding_box = self.nets[i].convert_features_to_bb_metric(pred_bb_features)
+          pred_bounding_box = nets[i].convert_features_to_bb_metric(pred_bb_features)
         else:
           pred_bounding_box = None
       else:
