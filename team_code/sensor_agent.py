@@ -353,12 +353,12 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         drop=float(env.get('V2X_DROP', 0.0)), rng=self.v2x_rng,
         randomize=env.get('V2X_RANDOMIZE', 'none'), salt=int(env.get('V2X_SEED', 0)), stats=stats)
     self.v2x_stats = stats
-    if stats.get('in_radius', 0) > 0:      # availability signal for the router; frames with no vehicle in radius say nothing
-      self.v2x_avail.append(stats['kept'] / stats['in_radius'])
+    if stats.get('in_radius', 0) > 0:      # availability = senders / vehicles present; a frame where nobody sends records 0, not nothing
+      self.v2x_avail.append(stats['sending'] / stats['in_radius'])
     if self.step % 200 == 0:
       print(f"v2x step {self.step}: rate={rate} tokens={env.get('V2X_TOKENS', 'all')} randomize={env.get('V2X_RANDOMIZE', 'none')} "
             f"latency={latency} noise={env.get('V2X_POS_NOISE', 0)}/{env.get('V2X_VEL_NOISE', 0)} drop={env.get('V2X_DROP', 0)} | "
-            f"vehicles {stats.get('total')} in-radius {stats.get('in_radius')} hidden {stats.get('hidden')} "
+            f"vehicles {stats.get('total')} in-radius {stats.get('in_radius')} sending {stats.get('sending')} hidden {stats.get('hidden')} "
             f"kept {stats.get('kept')} randomized {stats.get('randomized')}"
             + (f" | router: avail {sum(self.v2x_avail)/max(len(self.v2x_avail),1):.2f} thresh {self.route_thresh} "
                f"-> {'BASE' if self.route_to_base else 'plug-in'} (base frames {self.route_base_frames}/{self.step + 1})"

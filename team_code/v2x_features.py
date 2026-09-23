@@ -154,23 +154,34 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
               unchanged) but is rigidly rotated about the ego by a per-actor constant angle, so the message is present
               and plausible but no longer describes where the vehicle actually is. Separates 'the content of this
               message matters' from 'a token being there matters'.
-    `stats` (dict) receives counts: total, in_radius, hidden, kept, dropped, randomized."""
+    `stats` (dict) receives counts: total, in_radius (all vehicles within radius), sending (whose message arrived),
+    hidden, kept (tokens given to the model), dropped, randomized. The router uses sending / in_radius."""
     rng = rng if rng is not None else np.random.default_rng()
     cands = []
-    st = dict(total=0, in_radius=0, hidden=0, kept=0, dropped=0, randomized=0)
+    # Counters (all vehicles within `radius`, whether or not they send):
+    #   in_radius = vehicles physically present within the radius  (oracle denominator for the router)
+    #   sending   = of those, the ones whose message arrived (passed the penetration gate and the drop model)
+    #   kept      = tokens actually handed to the model (after the hidden/visible filter and the K-slot cap)
+    # The penetration gate must come AFTER the in_radius count -- 2026-09-20 it came before, so in_radius only counted
+    # senders and sending/in_radius was 1.0 at every penetration rate; the router never fired.
+    st = dict(total=0, in_radius=0, sending=0, hidden=0, kept=0, dropped=0, randomized=0)
     need_vis = (tokens != "all") or (randomize in ("hidden", "visible"))
     for veh in vehicles:
         aid, mat, yaw, spd, length = veh[:5]
         extent = veh[5] if len(veh) > 5 else (length / 2.0, 1.0, 0.8)
         st["total"] += 1
-        if rate < 1.0 and bucket_of(aid) >= int(rate * BUCKETS):
-            continue
         rel = relative_transform(ego_matrix, mat)
         x, y = float(rel[0]), float(rel[1])
         dist = math.hypot(x, y)
         if dist > radius:
             continue
         st["in_radius"] += 1
+        if rate < 1.0 and bucket_of(aid) >= int(rate * BUCKETS):
+            continue
+        if drop > 0.0 and rng.random() < drop:
+            st["dropped"] += 1
+            continue
+        st["sending"] += 1
         ryaw = math.atan2(math.sin(yaw - ego_yaw), math.cos(yaw - ego_yaw))
         hid = False
         if need_vis:
@@ -179,9 +190,6 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
             st["hidden"] += int(hid)
             if (tokens == "hidden" and not hid) or (tokens == "visible" and hid):
                 continue
-        if drop > 0.0 and rng.random() < drop:
-            st["dropped"] += 1
-            continue
         if randomize != "none" and (randomize == "all" or (randomize == "hidden") == hid):
             x, y, ryaw = rotate_about_ego(x, y, ryaw, rotation_angle(aid, salt))
             st["randomized"] += 1
