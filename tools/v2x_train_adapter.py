@@ -23,6 +23,11 @@ ap.add_argument("--calib_from", default="", help="run dir whose trained calibrat
 ap.add_argument("--res_gain", type=int, default=0, help="learnable per-layer scalar gain on the token residual")
 ap.add_argument("--aux_weight", type=float, default=0.0, help=">0: add aux L1 (nearest connected hidden hazard state from the adapted ts query) x weight")
 ap.add_argument("--init_std", type=float, default=0.0, help=">0: non-zero init of the residual output projections")
+ap.add_argument("--deep", type=int, default=0, help="1: gated cross-attention block after every decoder layer (decoder recomputed from the cached memory each step)")
+ap.add_argument("--teacher", default="", help="cache dir holding shard*_teacher_{ts,ckpt}.npy (tools/v2x_cache_teacher.py): distil from the co-trained plug-in at rate 1 instead of the imitation labels")
+ap.add_argument("--distill_T", type=float, default=2.0, help="softmax temperature for the target-speed distillation")
+ap.add_argument("--distill_focus", type=float, default=0.0, help=">0: up-weight frames by 1 + focus * KL(teacher || base) (where the teacher disagrees with the base)")
+ap.add_argument("--kl_base", type=float, default=0.0, help=">0: 'do no harm' term -- KL(base || student) on the target speed and L1 to the base checkpoints, only on frames where the BASE is already correct")
 ap.add_argument("--content_only", type=int, default=0, help="adapter residual depends on token contents only (no null token / slot embedding / biases)")
 ap.add_argument("--eval_only", default="", help="run dir of a trained adapter: load it and report metrics (incl. shuffled-token dependence), no training")
 ap.add_argument("--val_frac", type=float, default=0.05); ap.add_argument("--seed", type=int, default=0); ap.add_argument("--max_frames", type=int, default=0)
@@ -36,6 +41,11 @@ def load_field(name):
     x = np.concatenate([p[:] for p in parts], 0); return x[: a.max_frames] if a.max_frames else x
 meta = json.load(open(sorted(glob.glob(os.path.join(a.cache, "shard*_meta.json")))[0])); L, K = meta["L"], meta["K"]
 t0 = time.time(); joined = torch.from_numpy(load_field("joined")).to(dev)                       # fp16 (N, L+1, d)
+memory = torch.from_numpy(load_field("memory")).to(dev) if a.deep else None                      # fp16 (N, S, d): decoder input, needed to re-run the decoder with deep blocks
+teacher = None
+if a.teacher:
+    t_ix = load_field("teacher_index"); b_ix = load_field("index"); assert (t_ix == b_ix).all(), "teacher cache is not frame-aligned with the base cache"
+    teacher = dict(ts=torch.from_numpy(np.ascontiguousarray(load_field("teacher_ts"))).to(dev), ckpt=torch.from_numpy(np.ascontiguousarray(load_field("teacher_ckpt"))).to(dev))
 tens = {k: torch.from_numpy(np.ascontiguousarray(load_field(k))).to(dev) for k in ("base_ts", "base_ckpt", "target_point", "ts_twohot", "route", "coop_states", "coop_mask", "coop_bucket", "coop_hidden", "coop_hazard", "slowdown")}
 for k in ("coop_mask", "coop_hidden", "coop_hazard", "slowdown"): tens[k] = tens[k].float()
 route_dir = load_field("route_dir"); N = joined.shape[0]
@@ -57,6 +67,8 @@ else:
     cfg = base_cfg(); cfg.use_v2x = 1; cfg.use_v2x_adapter = 1; cfg.v2x_adapter_layers = a.layers; cfg.v2x_adapter_heads = a.heads; cfg.v2x_adapter_ffn = a.ffn
     cfg.v2x_adapter_content_only = a.content_only
     cfg.v2x_adapter_calib = a.calib
+    cfg.v2x_adapter_deep = a.deep
+    cfg.v2x_adapter_teacher = a.teacher; cfg.v2x_adapter_kl_base = a.kl_base; cfg.v2x_adapter_distill_T = a.distill_T
     cfg.v2x_adapter_res_gain = a.res_gain
     cfg.v2x_adapter_aux = int(a.aux_weight > 0); cfg.v2x_adapter_init_std = a.init_std; cfg.v2x_adapter_aux_weight = a.aux_weight
     cfg.v2x_adapter_calib_from = a.calib_from
@@ -68,6 +80,12 @@ net.to(dev).eval()   # frozen parts stay in eval; the adapter has no dropout / b
 for n_, p_ in net.named_parameters(): p_.requires_grad_(n_.startswith("v2x_adapter."))
 ad = net.v2x_adapter; n_ad = sum(p.numel() for p in ad.parameters()); print(f"adapter params {n_ad/1e6:.2f}M; gating={a.gating} tokens={a.tokens}", flush=True)
 w_ts = cfg.detailed_loss_weights["loss_target_speed"]; w_ck = cfg.detailed_loss_weights["loss_checkpoint"]
+
+def adapted(i, st, mk):
+    """adapter-modified planning queries for cache rows i. Deep mode re-runs the frozen decoder on the cached memory."""
+    if a.deep:
+        return net.v2x_join(net.checkpoint_query.expand(len(i), -1, -1), memory[i].float(), st, mk)
+    return ad(joined[i].float(), st, mk)
 
 def heads(q, tp):
     ck = net.checkpoint_decoder(q[:, :L], tp); ts = net.target_speed_network(q[:, L]); return ts, ck
@@ -89,18 +107,20 @@ def gate(st, mk, bk, hid, train):
 def evaluate(idx, rate):
     """metrics with the frame's own tokens, plus the same frames with SHUFFLED tokens (another frame's set, same rate):
     the difference is the part of the adapter's effect that depends on token content rather than on token presence."""
-    out = {"n": len(idx)}; correct = []; l1 = []; occ = []; slow = []; ce = []; c_sh = []; l1_sh = []; dlog = []; flip = []
+    out = {"n": len(idx)}; correct = []; l1 = []; occ = []; slow = []; ce = []; c_sh = []; l1_sh = []; dlog = []; flip = []; kdt = []; agr = []
     g = torch.Generator(device=dev); g.manual_seed(1234)
     with torch.no_grad():
         for s in range(0, len(idx), 4096):
             i = idx[s:s + 4096]; st, mk = tens["coop_states"][i], tens["coop_mask"][i]
             st, mk = v2x_features.apply_rate(st, mk, tens["coop_bucket"][i], rate); st, mk = gate(st, mk, None, tens["coop_hidden"][i], False)
-            q = ad(joined[i].float(), st, mk); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
-            perm = torch.randperm(len(i), device=dev, generator=g); q2 = ad(joined[i].float(), st[perm], mk[perm]); ts2, ck2 = heads(q2, tens["target_point"][i])
+            q = adapted(i, st, mk); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
+            perm = torch.randperm(len(i), device=dev, generator=g); q2 = adapted(i, st[perm], mk[perm]); ts2, ck2 = heads(q2, tens["target_point"][i])
             correct.append(ts.argmax(1) == lab.argmax(1)); l1.append((ck - tens["route"][i]).abs().mean(dim=(1, 2))); ce.append(F.cross_entropy(ts, lab, reduction="none"))
             c_sh.append(ts2.argmax(1) == lab.argmax(1)); l1_sh.append((ck2 - tens["route"][i]).abs().mean(dim=(1, 2))); dlog.append((ts - ts2).abs().mean(1)); flip.append(ts.argmax(1) != ts2.argmax(1))
             occ.append(occ_all[i]); slow.append(tens["slowdown"][i] > 0.5)
+            if teacher is not None: kdt.append(F.kl_div(F.log_softmax(ts, 1), F.softmax(teacher["ts"][i], 1), reduction="none").sum(1)); agr.append(ts.argmax(1) == teacher["ts"][i].argmax(1))
     c = torch.cat(correct).float(); l1 = torch.cat(l1); occ = torch.cat(occ); slow = torch.cat(slow); ce = torch.cat(ce)
+    if teacher is not None: out["kl_to_teacher"] = float(torch.cat(kdt).mean()); out["agree_teacher"] = float(torch.cat(agr).float().mean())
     c_sh = torch.cat(c_sh).float(); l1_sh = torch.cat(l1_sh); dlog = torch.cat(dlog); flip = torch.cat(flip).float()
     out.update(acc=float(c.mean()), ce=float(ce.mean()), l1=float(l1.mean()), acc_occ=float(c[occ].mean()) if occ.any() else float("nan"), n_occ=int(occ.sum()),
                acc_occ_slow=float(c[occ & slow].mean()) if (occ & slow).any() else float("nan"), n_occ_slow=int((occ & slow).sum()), acc_slow=float(c[slow].mean()),
@@ -122,7 +142,8 @@ def show(tag, ev):
     e1, e0 = ev[1.0], ev[0.0]
     print(f"{tag} | val r1 acc {100*e1['acc']:.2f} occ {100*e1['acc_occ']:.2f} occ&slow {100*e1['acc_occ_slow']:.2f} L1 {e1['l1']:.4f} "
           f"| r1 SHUFFLED tokens: acc {100*e1['acc_shuffled']:.2f} occ {100*e1['acc_occ_shuffled']:.2f} L1 {e1['l1_shuffled']:.4f} flip {100*e1['flip_shuffled']:.2f}% |Δlogit| {e1['dlogit_shuffled']:.3f} "
-          f"| r0.5 acc {100*ev[0.5]['acc']:.2f} occ {100*ev[0.5]['acc_occ']:.2f} | r0 acc {100*e0['acc']:.2f} occ {100*e0['acc_occ']:.2f}", flush=True)
+          f"| r0.5 acc {100*ev[0.5]['acc']:.2f} occ {100*ev[0.5]['acc_occ']:.2f} | r0 acc {100*e0['acc']:.2f} occ {100*e0['acc_occ']:.2f}"
+          + (f" | vs teacher: KL {e1['kl_to_teacher']:.3f} agree {100*e1['agree_teacher']:.1f}% (r0 KL {e0['kl_to_teacher']:.3f})" if "kl_to_teacher" in e1 else ""), flush=True)
 if a.eval_only:
     ev = {r: evaluate(va_idx, r) for r in (1.0, 0.5, 0.0)}; cr = cal_reference(va_idx); print(f"val base+calib: acc {100*cr['acc']:.2f} occ {100*cr['acc_occ']:.2f} L1 {cr['l1']:.4f}"); show("EVAL", ev)
     json.dump(dict(base_ref=base_ref, cal_ref=cr, val=ev), open(os.path.join(a.eval_only, "eval_shuffle.json"), "w"), indent=1); print("ADAPTER_EVAL_DONE"); sys.exit(0)
@@ -131,7 +152,7 @@ def cal_reference(idx):
     c = []; l1 = []; occ = []
     with torch.no_grad():
         for s in range(0, len(idx), 4096):
-            i = idx[s:s + 4096]; q = ad.calibrated(joined[i].float()); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
+            i = idx[s:s + 4096]; q = adapted(i, tens["coop_states"][i], torch.zeros_like(tens["coop_mask"][i])); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
             c.append(ts.argmax(1) == lab.argmax(1)); l1.append((ck - tens["route"][i]).abs().mean(dim=(1, 2))); occ.append(occ_all[i])
     c = torch.cat(c).float(); l1 = torch.cat(l1); occ = torch.cat(occ)
     return dict(acc=float(c.mean()), acc_occ=float(c[occ].mean()), l1=float(l1.mean()))
@@ -147,7 +168,7 @@ elif a.calib and not a.eval_only:
     for ep in range(a.calib_epochs):
         net.checkpoint_decoder.train(); perm = tr_idx[torch.randperm(len(tr_idx), device=dev)]; tl = 0.0
         for s in range(steps_per_epoch):
-            i = perm[s * a.bs:(s + 1) * a.bs]; q = ad.calibrated(joined[i].float()); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
+            i = perm[s * a.bs:(s + 1) * a.bs]; q = adapted(i, tens["coop_states"][i], torch.zeros_like(tens["coop_mask"][i])); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
             loss = w_ts * F.cross_entropy(ts, lab, weight=net.loss_speed.weight, label_smoothing=net.loss_speed.label_smoothing) + w_ck * (ck - tens["route"][i]).abs().mean()
             opt_c.zero_grad(set_to_none=True); loss.backward(); torch.nn.utils.clip_grad_norm_(cal_params, 1.0); opt_c.step(); tl += float(loss)
         net.checkpoint_decoder.eval(); cr = cal_reference(va_idx)
@@ -163,15 +184,31 @@ if a.calib and not a.eval_only:
 cal_ref = cal_reference(va_idx); print(f"val base+calib (= what rate 0 must reproduce): acc {100*cal_ref['acc']:.2f} occ {100*cal_ref['acc_occ']:.2f} L1 {cal_ref['l1']:.4f}", flush=True)
 for ep in range(a.epochs):
     net.checkpoint_decoder.train()   # cuDNN GRU backward requires train mode (no dropout in it, so the computation is unchanged)
-    perm = tr_idx[torch.randperm(len(tr_idx), device=dev)]; tl = tts = tck = taux = 0.0; t1 = time.time()
+    perm = tr_idx[torch.randperm(len(tr_idx), device=dev)]; tl = tts = tck = taux = tkd = tkl = 0.0; t1 = time.time()
     for s in range(steps_per_epoch):
         i = perm[s * a.bs:(s + 1) * a.bs]; st, mk = gate(tens["coop_states"][i], tens["coop_mask"][i], tens["coop_bucket"][i], tens["coop_hidden"][i], True)
-        q = ad(joined[i].float(), st, mk); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
+        q = adapted(i, st, mk); ts, ck = heads(q, tens["target_point"][i]); lab = tens["ts_twohot"][i]
         per_ts = F.cross_entropy(ts, lab, weight=net.loss_speed.weight, label_smoothing=net.loss_speed.label_smoothing, reduction="none")
         per_ck = (ck - tens["route"][i]).abs().mean(dim=(1, 2))
         w = torch.ones_like(per_ts) if a.occ_weight == 1.0 else (1.0 + (a.occ_weight - 1.0) * ((mk * tens["coop_hidden"][i] * tens["coop_hazard"][i]).sum(1) > 0).float())
         if a.hard_weight > 0: w = w + a.hard_weight * (tens["base_ts"][i].argmax(1) != lab.argmax(1)).float()
-        w = w / w.mean(); loss = w_ts * (per_ts * w).mean() + w_ck * (per_ck * w).mean()
+        w = w / w.mean()
+        if teacher is not None:
+            # distil the co-trained plug-in (rate 1): soft target-speed distribution at temperature T + its checkpoints
+            T = a.distill_T; t_logit = teacher["ts"][i]
+            kd = F.kl_div(F.log_softmax(ts / T, 1), F.softmax(t_logit / T, 1), reduction="none").sum(1) * T * T
+            l1_t = (ck - teacher["ckpt"][i]).abs().mean(dim=(1, 2))
+            if a.distill_focus > 0:   # emphasise frames where the teacher's answer differs from the base's
+                div = F.kl_div(F.log_softmax(tens["base_ts"][i] / T, 1), F.softmax(t_logit / T, 1), reduction="none").sum(1).detach()
+                wf = 1.0 + a.distill_focus * div / div.mean().clamp(min=1e-6); w = w * wf / wf.mean()
+            loss = w_ts * (kd * w).mean() + w_ck * (l1_t * w).mean(); tkd += float(kd.mean())
+        else:
+            loss = w_ts * (per_ts * w).mean() + w_ck * (per_ck * w).mean()
+        if a.kl_base > 0:      # do no harm: where the base is already right, stay close to the base
+            ok_b = (tens["base_ts"][i].argmax(1) == lab.argmax(1)).float()
+            kb = F.kl_div(F.log_softmax(ts, 1), F.softmax(tens["base_ts"][i], 1), reduction="none").sum(1)
+            lb = (ck - tens["base_ckpt"][i]).abs().mean(dim=(1, 2))
+            l_harm = ((w_ts * kb + w_ck * lb) * ok_b).sum() / ok_b.sum().clamp(min=1.0); loss = loss + a.kl_base * l_harm; tkl += float(l_harm)
         if a.aux_weight > 0:   # dense token signal: where is the nearest connected hidden hazard (masked to frames that have one)
             cand = mk * tens["coop_hidden"][i] * tens["coop_hazard"][i]; has_c = cand.sum(1) > 0
             first = torch.argmax(cand + 1e-3 * torch.arange(K, 0, -1, device=dev)[None].float() * cand, dim=1)
@@ -183,10 +220,14 @@ for ep in range(a.epochs):
     ev = {r: evaluate(va_idx, r) for r in (1.0, 0.5, 0.0)}
     rec = dict(epoch=ep, train_loss=tl / steps_per_epoch, train_ts_ce=tts / steps_per_epoch, train_ckpt_l1=tck / steps_per_epoch, val=ev, lr=sched.get_last_lr()[0], seconds=round(time.time() - t1))
     history.append(rec)
-    show(f"ep {ep:2d} loss {rec['train_loss']:.4f} (ts {rec['train_ts_ce']:.4f}, ck {rec['train_ckpt_l1']:.4f}" + (f", aux {taux/steps_per_epoch:.4f}" if a.aux_weight > 0 else "") + f") {rec['seconds']}s", ev)
+    show(f"ep {ep:2d} loss {rec['train_loss']:.4f} (ts {rec['train_ts_ce']:.4f}, ck {rec['train_ckpt_l1']:.4f}" + (f", aux {taux/steps_per_epoch:.4f}" if a.aux_weight > 0 else "")
+         + (f", kd {tkd/steps_per_epoch:.4f}" if teacher is not None else "") + (f", harm {tkl/steps_per_epoch:.4f}" if a.kl_base > 0 else "") + f") {rec['seconds']}s", ev)
 assert abs(ev[0.0]["acc"] - base_ref["acc"]) < 1e-6 or a.tokens == "hidden" or True
 with torch.no_grad():
-    i = va_idx[:8192]; q = ad.calibrated(joined[i].float()); out = ad(joined[i].float(), tens["coop_states"][i], tens["coop_mask"][i]); rel = (ad.last_delta.norm(dim=-1) / q.norm(dim=-1).clamp(min=1e-6))
+    i = va_idx[:8192]; q = adapted(i, tens["coop_states"][i], torch.zeros_like(tens["coop_mask"][i])); out = adapted(i, tens["coop_states"][i], tens["coop_mask"][i])
+    rel = ((out - q).norm(dim=-1) / q.norm(dim=-1).clamp(min=1e-6))
+    if a.deep:   # consistency of the cached path: decoder re-run from fp16 memory vs the cached fp16 decoder output
+        print(f"deep: decoder re-run from cached memory vs cached joined, max |Δ| {float((q - ad.calibrated(joined[i].float())).abs().max()):.2e}", flush=True)
     print(f"token residual |Δ|/|q| on val: mean {float(rel.mean()):.3f}, ts-query {float(rel[:, L].mean()):.3f}, ckpt-queries {float(rel[:, :L].mean()):.3f}" + (f"; res_gain {ad.res_gain_param.detach().cpu().numpy().round(3).tolist()}" if ad.use_res_gain else ""), flush=True)
 print(f"rate-0 check: adapter r0 acc {100*ev[0.0]['acc']:.3f} vs base+calib {100*cal_ref['acc']:.3f} vs base {100*base_ref['acc']:.3f} (r0 must equal base+calib; == base when no calib)", flush=True)
 assert abs(ev[0.0]["acc"] - cal_ref["acc"]) < 1e-4, "rate 0 must equal base + calib"

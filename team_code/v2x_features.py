@@ -17,8 +17,12 @@ STATE_DIM = 7
 BUCKETS = 1000
 
 
-def bucket_of(track_id) -> int:
-    return zlib.crc32(str(track_id).encode("utf-8")) % BUCKETS
+def bucket_of(track_id, salt=0) -> int:
+    """Deterministic penetration bucket of one actor. salt=0 reproduces the historical hash (every result so far);
+    salt>0 draws a different silent set -- so that eval seeds also sample WHICH vehicles stay silent (2026-09-24 concern:
+    with the unsalted hash the silent set may be identical across eval seeds and the SE of the penetration curve understated)."""
+    key = str(track_id) if salt == 0 else f"{salt}:{track_id}"
+    return zlib.crc32(key.encode("utf-8")) % BUCKETS
 
 
 def _state(x, y, yaw, speed, length):
@@ -62,6 +66,33 @@ def coop_states_from_boxes(boxes, k=16, y_augmentation=0.0, yaw_augmentation=0.0
     for j, (_, vec, bk, hid, haz) in enumerate(cands[:k]):
         states[j], mask[j], bucket[j], hidden[j], hazard[j] = vec, 1.0, bk, hid, haz
     return states, mask, bucket, hidden, hazard
+
+
+def rasterize_states(states, mask, min_x=-32.0, max_x=32.0, min_y=-32.0, max_y=32.0, pixels_per_meter=4.0, width=2.0):
+    """Late fusion: draw the received vehicle states into the ego BEV grid used by the lidar histogram.
+    states (bs, K, 7) normalised as _state(); mask (bs, K). Returns (bs, 3, H, W): [occupancy, vx/10, vy/10] inside each
+    vehicle's oriented box (length from the message, width assumed `width` m). Pixel layout is the one of
+    CARLA_Data.lidar_to_histogram_features: [C, iy, ix] with iy indexing CARLA y (right) from min_y and ix indexing
+    CARLA x (front) from min_x. Empty mask -> all zeros, so the channel is exactly silent without messages."""
+    bs, k, _ = states.shape
+    dev, dt = states.device, states.dtype
+    H = int(round((max_y - min_y) * pixels_per_meter)); W = int(round((max_x - min_x) * pixels_per_meter))
+    xs = min_x + (torch.arange(W, device=dev, dtype=dt) + 0.5) / pixels_per_meter          # (W,) CARLA x of column centres
+    ys = min_y + (torch.arange(H, device=dev, dtype=dt) + 0.5) / pixels_per_meter          # (H,) CARLA y of row centres
+    Yg, Xg = torch.meshgrid(ys, xs, indexing="ij")                                          # (H, W)
+    cx = states[..., 0] * 32.0; cy = states[..., 1] * 32.0; vx = states[..., 2] * 10.0; vy = states[..., 3] * 10.0
+    c = states[..., 4]; sn = states[..., 5]; half_l = states[..., 6] * 5.0 / 2.0
+    dx = Xg[None, None] - cx[..., None, None]; dy = Yg[None, None] - cy[..., None, None]       # (bs, K, H, W)
+    u = dx * c[..., None, None] + dy * sn[..., None, None]                                    # along the vehicle's heading
+    v = -dx * sn[..., None, None] + dy * c[..., None, None]                                   # across
+    inside = (u.abs() <= half_l[..., None, None]) & (v.abs() <= width / 2.0) & (mask[..., None, None] > 0.5)   # (bs, K, H, W)
+    inside_f = inside.to(dt)
+    occ = inside_f.amax(dim=1)
+    # velocity channels: where boxes overlap take the nearest vehicle's (slots are distance-sorted, so the first valid wins)
+    first = inside_f.cumsum(dim=1) <= 1.0
+    sel = (inside_f * first.to(dt))
+    vx_map = (sel * (vx / 10.0)[..., None, None]).sum(dim=1); vy_map = (sel * (vy / 10.0)[..., None, None]).sum(dim=1)
+    return torch.stack((occ, vx_map, vy_map), dim=1)
 
 
 def apply_rate(states, mask, bucket, rate):
@@ -110,6 +141,20 @@ def rotate_about_ego(x, y, yaw, angle):
     return c * x - s * y, s * x + c * y, math.atan2(math.sin(yaw + angle), math.cos(yaw + angle))
 
 
+def unmatched_detections(sender_xy, det_xy, match_dist=2.5):
+    """Deployable estimate of the vehicles that did NOT send: ego-perceived vehicle detections (previous frame, ego frame,
+    metres) that lie farther than `match_dist` from every received message. Vehicles that neither send nor are seen are
+    invisible to this estimate, so the derived availability sending/(sending+unmatched) is biased UPWARD vs the oracle."""
+    if len(det_xy) == 0:
+        return 0
+    det = np.asarray(det_xy, dtype=np.float64).reshape(-1, 2)
+    if len(sender_xy) == 0:
+        return int(len(det))
+    snd = np.asarray(sender_xy, dtype=np.float64).reshape(-1, 2)
+    d2 = ((det[:, None, :] - snd[None, :, :]) ** 2).sum(-1)
+    return int((d2.min(axis=1) > match_dist ** 2).sum())
+
+
 def route_use_base(history, thresh):
     """Availability router: True = fall back to the V2X-free base model. `history` is a deque of per-frame
     kept/in_radius ratios (frames with no vehicle in radius contribute nothing). Undecidable (empty history) -> False,
@@ -142,7 +187,7 @@ def select_delayed(history, latency_frames):
 
 def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius=64.0, relative_transform=None,
                            lidar=None, hidden_pts=5, tokens="all", pos_noise=0.0, vel_noise=0.0, drop=0.0, rng=None,
-                           randomize="none", salt=0, stats=None):
+                           randomize="none", salt=0, bucket_salt=0, stats=None):
     """Closed-loop counterpart. `vehicles` = iterable of (actor_id, actor_matrix(4x4), yaw_rad, speed, length[, extent(3,)]);
     `relative_transform(ego_matrix, actor_matrix)` must be team_code.transfuser_utils.get_relative_transform so the
     frame matches the recorded boxes exactly. Returns torch tensors (1,k,7), (1,k).
@@ -155,7 +200,8 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
               and plausible but no longer describes where the vehicle actually is. Separates 'the content of this
               message matters' from 'a token being there matters'.
     `stats` (dict) receives counts: total, in_radius (all vehicles within radius), sending (whose message arrived),
-    hidden, kept (tokens given to the model), dropped, randomized. The router uses sending / in_radius."""
+    hidden, kept (tokens given to the model), dropped, randomized, and sender_xy (ego-frame positions of the arrived
+    messages). bucket_salt: 0 = historical hash; >0 = a different silent set per eval seed."""
     rng = rng if rng is not None else np.random.default_rng()
     cands = []
     # Counters (all vehicles within `radius`, whether or not they send):
@@ -165,6 +211,7 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
     # The penetration gate must come AFTER the in_radius count -- 2026-09-20 it came before, so in_radius only counted
     # senders and sending/in_radius was 1.0 at every penetration rate; the router never fired.
     st = dict(total=0, in_radius=0, sending=0, hidden=0, kept=0, dropped=0, randomized=0)
+    sender_xy = []
     need_vis = (tokens != "all") or (randomize in ("hidden", "visible"))
     for veh in vehicles:
         aid, mat, yaw, spd, length = veh[:5]
@@ -176,12 +223,13 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
         if dist > radius:
             continue
         st["in_radius"] += 1
-        if rate < 1.0 and bucket_of(aid) >= int(rate * BUCKETS):
+        if rate < 1.0 and bucket_of(aid, bucket_salt) >= int(rate * BUCKETS):
             continue
         if drop > 0.0 and rng.random() < drop:
             st["dropped"] += 1
             continue
         st["sending"] += 1
+        sender_xy.append((x, y))     # true position of every arrived message, before the K cap (router proxy matches against it)
         ryaw = math.atan2(math.sin(yaw - ego_yaw), math.cos(yaw - ego_yaw))
         hid = False
         if need_vis:
@@ -205,4 +253,5 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
     st["kept"] = int(mask.sum())
     if stats is not None:
         stats.update(st)
+        stats["sender_xy"] = sender_xy
     return torch.from_numpy(states)[None], torch.from_numpy(mask)[None]

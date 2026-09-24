@@ -100,4 +100,26 @@ ok(Sd["sending"] + Sd["dropped"] == 6 and Sd["kept"] == Sd["sending"], f"drop lo
 Sk = {}; many = [(200 + i, mat(8.0 + 2.5 * i, 3.0, 0.0), 0.0, 5.0, 4.5, (2.25, 1.0, 0.8)) for i in range(20)]
 V.coop_states_from_world(ego, 0.0, many, k=16, relative_transform=rel, stats=Sk)
 ok(Sk["in_radius"] == 20 and Sk["sending"] == 20 and Sk["kept"] == 16, "the K-slot cap lowers kept but not sending: 20 senders -> availability 1.0, 16 tokens")
+# ---- bucket salt: 0 reproduces the historical hash, >0 gives a different silent set ----
+ok(all(V.bucket_of(i) == V.bucket_of(i, 0) for i in range(500)), "bucket_of(id, salt=0) is bitwise the historical hash")
+ok(sum(V.bucket_of(i, 1) != V.bucket_of(i, 0) for i in range(500)) > 450, "salt=1 changes the bucket of nearly every actor")
+sil = lambda salt: {i for i in range(1000) if V.bucket_of(i, salt) >= 500}
+ok(0.4 < len(sil(0)) / 1000 < 0.6 and 0.4 < len(sil(1)) / 1000 < 0.6, f"at rate 0.5 each salt silences about half ({len(sil(0))}, {len(sil(1))} of 1000)")
+ov = len(sil(0) & sil(1)) / len(sil(0)); ok(0.35 < ov < 0.65, f"silent sets of salt 0 and 1 overlap like independent draws ({100*ov:.0f}%, expect ~50%)")
+Ss = {}; V.coop_states_from_world(ego, 0.0, vehs, k=16, relative_transform=rel, rate=0.5, bucket_salt=7, stats=Ss)
+ok(Ss["in_radius"] == 6 and 0 <= Ss["sending"] <= 6, f"bucket_salt threads through coop_states_from_world (r0.5, salt 7: sending {Ss['sending']}/6)")
+# ---- deployable denominator: unmatched detections ----
+S1 = {}; V.coop_states_from_world(ego, 0.0, vehs, k=16, relative_transform=rel, rate=1.0, stats=S1)
+ok(len(S1["sender_xy"]) == 6, "sender_xy lists every arrived message (6 at rate 1)")
+det_all = [(10.0 + 6 * i, -4.0 if i % 2 else 4.0) for i in range(6)]           # the ego detects all six exactly where they are
+ok(V.unmatched_detections(S1["sender_xy"], det_all) == 0, "rate 1: every detection matches a message -> 0 unmatched -> availability 1.0")
+S5 = {}; V.coop_states_from_world(ego, 0.0, vehs, k=16, relative_transform=rel, rate=0.5, stats=S5)
+u = V.unmatched_detections(S5["sender_xy"], det_all); ok(u == 6 - S5["sending"], f"rate 0.5: unmatched = detected − sending ({u} = 6 − {S5['sending']}) -> availability {S5['sending']/(S5['sending']+u):.2f}")
+S0 = {}; V.coop_states_from_world(ego, 0.0, vehs, k=16, relative_transform=rel, rate=0.0, stats=S0)
+ok(V.unmatched_detections(S0["sender_xy"], det_all) == 6, "rate 0: all detections unmatched -> availability 0.0")
+det_jit = [(x + 0.8, y - 0.6) for x, y in det_all]; ok(V.unmatched_detections(S1["sender_xy"], det_jit) == 0, "detections 1 m off still match within 2.5 m")
+ok(V.unmatched_detections(S1["sender_xy"], det_all[:3]) == 0 and V.unmatched_detections([], det_all[:3]) == 3 and V.unmatched_detections(S1["sender_xy"], []) == 0, "edge cases: partial detections, no messages, no detections")
+# upward bias: a hidden non-sender is invisible to the proxy
+det_vis = det_all[:3]; S5h = dict(S5); snd_vis = [xy for xy in S5["sender_xy"] if xy in det_vis]
+print(f"proxy bias illustration (r0.5, only 3 vehicles detectable): oracle {S5['sending']}/6 = {S5['sending']/6:.2f}; proxy {S5['sending']}/({S5['sending']}+{V.unmatched_detections(S5['sender_xy'], det_vis)}) = {S5['sending']/(S5['sending']+V.unmatched_detections(S5['sender_xy'], det_vis)):.2f}")
 print("FILTER SMOKE PASSED")

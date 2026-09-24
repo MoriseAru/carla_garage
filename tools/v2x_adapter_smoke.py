@@ -100,4 +100,39 @@ ok(torch.allclose(obt[1], ob[1], atol=1e-4), "base model untouched by adapter tr
 sd = net_a.state_dict(); net_c = modmod.LidarCenterNet(cfg_a); net_c.load_state_dict(sd, strict=True)
 ok(True, "state_dict round-trips with strict=True (sensor_agent loads strict)")
 js = jsonpickle.encode(cfg_a); cfg_r = jsonpickle.decode(js); ok(getattr(cfg_r, "use_v2x_adapter", 0) == 1 and cfg_r.v2x_adapter_layers == 2, "config.json round-trip keeps adapter fields")
+# ---- deep mode: per-layer blocks inside the decoder ----
+cfg_d = base_cfg(); cfg_d.use_v2x = 1; cfg_d.use_v2x_adapter = 1; cfg_d.v2x_adapter_deep = 1; cfg_d.v2x_adapter_calib = 0; cfg_d.v2x_adapter_ffn = 512
+net_d = modmod.LidarCenterNet(cfg_d); res = net_d.load_state_dict(sd_base, strict=False); net_d.to(dev).eval()
+ok(not res.unexpected_keys and all(k.startswith("v2x_adapter.") for k in res.missing_keys), f"deep: base weights load, missing = adapter only ({len(res.missing_keys)} tensors)")
+n_deep = sum(p.numel() for n, p in net_d.named_parameters() if n.startswith("v2x_adapter.deep_layers")); print(f"deep blocks: {n_deep/1e6:.2f}M params over {len(net_d.v2x_adapter.deep_layers)} decoder layers")
+with torch.no_grad():
+    od0 = net_d(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=torch.zeros_like(mk))
+    od1 = net_d(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=mk)
+    odn = net_d(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd)
+ok(torch.equal(od0[1], ob[1]) and torch.equal(od0[2], ob[2]), "deep: rate 0 == base bitwise (unrolled decoder + identity blocks == nn.TransformerDecoder)")
+ok(torch.equal(odn[1], ob[1]) and torch.equal(odn[2], ob[2]), "deep: no coop kwargs == base bitwise")
+ok(torch.allclose(od1[1], ob[1], atol=1e-5) and torch.allclose(od1[2], ob[2], atol=1e-5), "deep: rate 1 at initialisation == base (zero-init blocks)")
+store_d = {}; h = net_d.join.register_forward_hook(lambda m, inp, out: store_d.update(memory=inp[1].detach(), joined=out.detach()))
+with torch.no_grad(): _ = net_d(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd)
+h.remove()
+with torch.no_grad(): q_re = net_d.v2x_join(net_d.checkpoint_query.expand(rgb.shape[0], -1, -1), store_d["memory"], st, torch.zeros_like(mk))
+ok(torch.equal(q_re, store_d["joined"]), "deep: v2x_join from the captured memory reproduces the decoder output bitwise (cache pipeline valid)")
+for n_, p_ in net_d.named_parameters(): p_.requires_grad_(n_.startswith("v2x_adapter."))
+opt_d = torch.optim.AdamW([p for p in net_d.parameters() if p.requires_grad], lr=1e-3); net_d.checkpoint_decoder.train()
+for step in range(15):
+    q = net_d.v2x_join(net_d.checkpoint_query.expand(rgb.shape[0], -1, -1), store_d["memory"], st, mk)
+    ck = net_d.checkpoint_decoder(q[:, :L], tp); ts = net_d.target_speed_network(q[:, L])
+    loss = F.cross_entropy(ts, ts_label) + torch.abs(ck - ck_label).mean(); opt_d.zero_grad(); loss.backward()
+    if step == 0:
+        gn = [n_ for n_, p_ in net_d.named_parameters() if p_.grad is not None and float(p_.grad.abs().sum()) > 0]
+        ok(len(gn) > 0 and all(n_.startswith("v2x_adapter.deep_layers") for n_ in gn), f"deep: gradients only on the deep blocks ({len(gn)} tensors)")
+        ok(len({n_.split('.')[2] for n_ in gn}) == len(net_d.v2x_adapter.deep_layers), "deep: every decoder layer's block receives gradient")
+    opt_d.step()
+net_d.eval()
+with torch.no_grad():
+    od1t = net_d(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=mk)
+    od0t = net_d(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=torch.zeros_like(mk))
+ok(float((od1t[1] - ob[1]).abs().mean()) > 1e-4, f"deep: after 15 steps rate 1 differs from base (mean |Δ logits| {float((od1t[1] - ob[1]).abs().mean()):.4f})")
+ok(torch.equal(od0t[1], ob[1]) and torch.equal(od0t[2], ob[2]), "deep: after training rate 0 is still bitwise the base")
+modmod.LidarCenterNet(cfg_d).load_state_dict(net_d.state_dict(), strict=True); ok(True, "deep: state_dict round-trips strict (sensor_agent loads strict)")
 print("ADAPTER SMOKE PASSED")

@@ -32,6 +32,8 @@ class TransfuserBackbone(nn.Module):
       in_channels = 2 * config.lidar_seq_len
     else:
       in_channels = config.lidar_seq_len
+    if getattr(config, 'use_v2x_bev', 0):   # late-fusion raster channels ride along with the lidar histogram
+      in_channels += int(getattr(config, 'v2x_bev_channels', 3))
 
     self.avgpool_img = nn.AdaptiveAvgPool2d((self.config.img_vert_anchors, self.config.img_horz_anchors))
 

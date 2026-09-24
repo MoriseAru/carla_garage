@@ -844,6 +844,11 @@ class GlobalConfig:
     # Scheme A: frozen-base residual adapter (model.V2XResidualAdapter). The decoder memory stays the base model's; the
     # planning queries get a zero-initialised cross-attention residual from the cooperative tokens, gated to exactly zero
     # when no token is valid -> rate 0 is the base model by construction; only v2x_adapter.* is trained.
+    # Late fusion (input level): the received vehicle states are rasterised into extra lidar-BEV channels (v2x_features.rasterize_states)
+    # and go through the lidar backbone together with the point histogram. use_v2x_bev is independent of use_v2x (decoder tokens).
+    self.use_v2x_bev = 0
+    self.v2x_bev_channels = 3      # occupancy, vx/10, vy/10
+    self.v2x_bev_width = 2.0       # assumed vehicle width (m); the message carries the length only
     self.use_v2x_adapter = 0
     self.v2x_adapter_layers = 2
     self.v2x_adapter_heads = 8
@@ -851,6 +856,7 @@ class GlobalConfig:
     self.v2x_adapter_calib = 0          # 1: token-free calibration residual trained first (tokens off) and frozen; rate 0 == base + calib
     self.v2x_adapter_aux = 0            # 1: training-only aux head (nearest hidden hazard state) inside the adapter
     self.v2x_adapter_init_std = 0.0     # >0: non-zero init of the residual output projections
+    self.v2x_adapter_deep = 0            # 1: gated cross-attention block after EVERY decoder layer (Flamingo-style) instead of one block on the decoder output
     self.v2x_adapter_res_gain = 0       # 1: learnable per-layer scalar gain on the token residual
     self.v2x_adapter_content_only = 0   # 1: residual is a function of token contents only (no null token / slot embedding / biases; MLP on the attention output)
     self.plant_precision_pos = 7  # 7: 0.5 meters

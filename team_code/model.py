@@ -30,9 +30,23 @@ class V2XResidualAdapter(nn.Module):
   without cooperation (rate 0) is exactly the base model. An always-valid null key keeps the softmax defined."""
 
   def __init__(self, d_model, state_dim, k, num_layers=2, num_heads=8, dim_ff=512, content_only=False, calib=False, res_gain=False,
-               aux=False, init_std=0.0):
+               aux=False, init_std=0.0, deep=0, d_ff_deep=512):
     super().__init__()
     self.k = k
+    # deep > 0: one gated cross-attention + MLP block AFTER EACH of the `deep` decoder layers (queries read the tokens
+    # between layers, so the token can change what later layers attend to in the BEV memory). Zero-initialised output
+    # projections and the same availability gate: without a valid token every block is the identity -> rate 0 == base.
+    self.deep = int(deep)
+    if self.deep:
+      self.deep_layers = nn.ModuleList()
+      for _ in range(self.deep):
+        blk = nn.Module()
+        blk.ln_q = nn.LayerNorm(d_model); blk.ln_f = nn.LayerNorm(d_model)
+        blk.attn = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        blk.mlp = nn.Sequential(nn.Linear(d_model, d_ff_deep), nn.GELU(), nn.Linear(d_ff_deep, d_model))
+        nn.init.zeros_(blk.attn.out_proj.weight); nn.init.zeros_(blk.attn.out_proj.bias)
+        nn.init.zeros_(blk.mlp[2].weight); nn.init.zeros_(blk.mlp[2].bias)
+        self.deep_layers.append(blk)
     if aux:   # training-only head: regress the nearest connected hidden hazard's state from the adapted target-speed query (dense token signal)
       self.aux_head = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, 4))
     self.init_std = float(init_std)
@@ -82,22 +96,37 @@ class V2XResidualAdapter(nn.Module):
   def calibrated(self, queries):
     return queries + self.calib(queries) if self.use_calib else queries
 
+  def tokens(self, coop_states, coop_mask):
+    """(tok (bs, 1+K or K, d), key_padding_mask, has (bs,)) -- shared by the output block and the deep blocks."""
+    bs, k = coop_mask.shape
+    valid = coop_mask > 0.5
+    has = valid.any(dim=1)
+    if self.content_only:
+      tok = self.coop_proj(coop_states); kpm = ~valid
+      kpm[~has, 0] = False
+    else:
+      tok = self.coop_proj(coop_states) + self.slot_embed.weight[None, :k]
+      tok = torch.cat((self.null_token.expand(bs, 1, -1).to(tok.dtype), tok), dim=1)
+      kpm = torch.cat((torch.zeros(bs, 1, dtype=torch.bool, device=coop_mask.device), ~valid), dim=1)
+    return tok, kpm, has
+
+  def deep_step(self, x, li, tok, kpm, has):
+    """Residual read of the tokens after decoder layer `li`; exactly the identity for rows without a valid token."""
+    blk = self.deep_layers[li]
+    a, _ = blk.attn(blk.ln_q(x), tok, tok, key_padding_mask=kpm, need_weights=False)
+    y = x + a
+    y = y + blk.mlp(blk.ln_f(y))
+    return x + (y - x) * has[:, None, None].to(x.dtype)
+
   def forward(self, queries, coop_states, coop_mask, need_weights=False):
     queries = self.calibrated(queries)   # token-free part (identity unless calib)
     if coop_states is None or coop_mask is None:
       self.last_delta = None
       return queries
-    bs, k = coop_mask.shape
-    valid = coop_mask > 0.5
-    has = valid.any(dim=1)
-    if self.content_only:
-      tok = self.coop_proj(coop_states)
-      kpm = ~valid
-      kpm[~has, 0] = False   # rows without any valid token attend a dummy slot so the softmax is defined; the gate zeroes them below
-    else:
-      tok = self.coop_proj(coop_states) + self.slot_embed.weight[None, :k]
-      tok = torch.cat((self.null_token.expand(bs, 1, -1).to(tok.dtype), tok), dim=1)
-      kpm = torch.cat((torch.zeros(bs, 1, dtype=torch.bool, device=coop_mask.device), ~valid), dim=1)
+    if self.deep:                        # deep mode: the token blocks live inside the decoder (see LidarCenterNet.v2x_join)
+      self.last_delta = None
+      return queries
+    tok, kpm, has = self.tokens(coop_states, coop_mask)
     x = queries
     attn = []
     for li, layer in enumerate(self.layers):
@@ -266,7 +295,10 @@ class LidarCenterNet(nn.Module):
                                                 calib=getattr(self.config, 'v2x_adapter_calib', 0),
                                                 res_gain=getattr(self.config, 'v2x_adapter_res_gain', 0),
                                                 aux=getattr(self.config, 'v2x_adapter_aux', 0),
-                                                init_std=getattr(self.config, 'v2x_adapter_init_std', 0.0))
+                                                init_std=getattr(self.config, 'v2x_adapter_init_std', 0.0),
+                                                deep=self.config.num_transformer_decoder_layers if getattr(self.config, 'v2x_adapter_deep', 0) else 0,
+                                                d_ff_deep=getattr(self.config, 'v2x_adapter_ffn', 512))
+          assert not (getattr(self.config, 'v2x_adapter_deep', 0) and self.config.tp_attention), 'deep adapter needs the plain nn.TransformerDecoder'
         elif self.config.use_v2x:
           d_model = self.config.gru_input_size
           self.coop_proj = nn.Sequential(nn.Linear(self.config.v2x_state_dim, d_model), nn.ReLU(inplace=True),
@@ -409,6 +441,36 @@ class LidarCenterNet(nn.Module):
     if self.config.tp_attention:
       nn.init.uniform_(self.tp_pos_embed)
 
+  def adapt_state_dict_for_bev_fusion(self, sd):
+    """A V2X-free base checkpoint into a use_v2x_bev model: the lidar stem conv gained input channels; copy the base
+    weights into the histogram channel(s) and ZERO the new raster channels, so the network is bitwise the base at init.
+    Returns (adapted state dict, list of padded keys)."""
+    own = self.state_dict(); out = dict(sd); padded = []
+    for k, v in sd.items():
+      if k in own and own[k].shape != v.shape:
+        assert v.dim() == 4 and own[k].dim() == 4 and own[k].shape[0] == v.shape[0] and own[k].shape[2:] == v.shape[2:] \
+            and own[k].shape[1] > v.shape[1] and 'lidar_encoder' in k, f'unexpected shape change {k}: {tuple(v.shape)} -> {tuple(own[k].shape)}'
+        w = torch.zeros(own[k].shape, dtype=v.dtype); w[:, :v.shape[1]] = v; out[k] = w; padded.append(k)
+    return out, padded
+
+  def v2x_join(self, query, memory, coop_states, coop_mask):
+    """Decoder pass for the checkpoint queries with the frozen-base adapter. Output block only: join -> adapter.
+    Deep: unroll self.join layer by layer (bitwise equal to nn.TransformerDecoder), insert the adapter block after each
+    layer, final norm, then the (frozen) calibration residual. Without tokens both paths reproduce the base decoder."""
+    ad = self.v2x_adapter
+    if not ad.deep:
+      return ad(self.join(query, memory), coop_states, coop_mask)
+    if coop_states is None or coop_mask is None:
+      return ad.calibrated(self.join(query, memory))
+    tok, kpm, has = ad.tokens(coop_states, coop_mask)
+    x = query
+    for li, layer in enumerate(self.join.layers):
+      x = layer(x, memory)
+      x = ad.deep_step(x, li, tok, kpm, has)
+    if self.join.norm is not None:
+      x = self.join.norm(x)
+    return ad.calibrated(x)
+
   def coop_tokens(self, coop_states, coop_mask, bs):
     """(bs, K, d) cooperative-vehicle tokens; invalid or non-connected slots become the learned null token."""
     k = self.config.v2x_k
@@ -505,9 +567,10 @@ class LidarCenterNet(nn.Module):
             tp_attention = gru_attention[num_pixel_tokens + add:]
             attention_weights = [vision_attention.item(), speed_attention.item(), tp_attention.item()]
           else:
-            joined_checkpoint_features = self.join(self.checkpoint_query.repeat(bs, 1, 1), fused_features)
             if self.v2x_adapter_on:   # scheme A: residual read of the coop tokens; identity when no token is valid
-              joined_checkpoint_features = self.v2x_adapter(joined_checkpoint_features, coop_states, coop_mask)
+              joined_checkpoint_features = self.v2x_join(self.checkpoint_query.repeat(bs, 1, 1), fused_features, coop_states, coop_mask)
+            else:
+              joined_checkpoint_features = self.join(self.checkpoint_query.repeat(bs, 1, 1), fused_features)
 
           gru_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]
           target_speed_features = joined_checkpoint_features[:, self.config.predict_checkpoint_len]

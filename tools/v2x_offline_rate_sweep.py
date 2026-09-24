@@ -33,7 +33,18 @@ g = torch.Generator().manual_seed(0); idx = torch.randperm(len(ds), generator=g)
 sub = torch.utils.data.Subset(ds, idx); dl = torch.utils.data.DataLoader(sub, batch_size=a.bs, shuffle=False, num_workers=16)
 print(f"frames {len(sub)} of {len(ds)}; K={cfg_v.v2x_k}", flush=True)
 
-conds = ["base", "v2x_r1.0", "v2x_r0.75", "v2x_r0.5", "v2x_r0.25", "v2x_r0", "v2x_r0_drop"]
+# "_c" = COMPACTED partial penetration: the surviving tokens are moved to the front slots (slot j = j-th nearest SENDER),
+# which is what the closed-loop agent does (coop_states_from_world filters, then sorts and fills from slot 0).
+# Without "_c" the silent vehicles' slots are nulled IN PLACE (slot j = j-th nearest vehicle, as in training with apply_rate).
+# Training at rate 1 only ever showed nulls at the tail, so both are out of distribution -- differently.
+conds = ["base", "v2x_r1.0", "v2x_r0.75", "v2x_r0.75_c", "v2x_r0.5", "v2x_r0.5_c", "v2x_r0.25", "v2x_r0.25_c",
+         "v2x_r0.1", "v2x_r0.1_c", "v2x_r0.05", "v2x_r0.05_c", "v2x_r0", "v2x_r0_drop"]
+
+
+def compact_slots(states, mask):
+    """Move the valid slots to the front, keeping their (distance) order; the tail becomes null. Mirrors the agent."""
+    order = torch.argsort((mask < 0.5).to(torch.int64), dim=1, stable=True)
+    return torch.gather(states, 1, order[..., None].expand_as(states)), torch.gather(mask, 1, order)
 acc = {c: 0 for c in conds}; ce = {c: 0.0 for c in conds}; l1 = {c: 0.0 for c in conds}; n = 0; fill = []; any_null = 0
 correct = {c: [] for c in conds}; strata = {"occ": [], "occ_slow": [], "slow": [], "stop_label": []}; aux_logits, aux_labels = [], []
 orig_coop_tokens = net_v.coop_tokens
@@ -60,7 +71,8 @@ with torch.no_grad():
                 if c == "v2x_r0_drop":
                     net_v.coop_tokens = drop_tokens; s, m = st, torch.zeros_like(mk)
                 else:
-                    net_v.coop_tokens = orig_coop_tokens; s, m = v2x_features.apply_rate(st, mk, bk, float(c.split("_r")[1]))
+                    net_v.coop_tokens = orig_coop_tokens; s, m = v2x_features.apply_rate(st, mk, bk, float(c.split("_r")[1].replace("_c", "")))
+                    if c.endswith("_c"): s, m = compact_slots(s, m)
                 out = net_v(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, target_point_next=tpn, coop_states=s, coop_mask=m)
             pred_ts, pred_ckpt = out[1], out[2]
             correct[c] += (pred_ts.argmax(1) == ts_label).tolist()
@@ -77,7 +89,7 @@ print("\nstratified target-speed accuracy (%), frames where a CONNECTED hidden h
 strat = {}
 for k, v in strata.items():
     sel = np.array(v, dtype=bool); strat[k] = {c: float(np.mean(np.array(correct[c])[sel])) if sel.sum() else float("nan") for c in conds}
-    print(f"  {k:10s} n={int(sel.sum()):5d}  " + "  ".join(f"{c}={100*strat[k][c]:5.1f}" for c in ("base", "v2x_r1.0", "v2x_r0.5", "v2x_r0")))
+    print(f"  {k:10s} n={int(sel.sum()):5d}  " + "  ".join(f"{c}={100*strat[k][c]:5.1f}" for c in ("base", "v2x_r1.0", "v2x_r0.5", "v2x_r0.5_c", "v2x_r0.25", "v2x_r0.25_c", "v2x_r0.1_c", "v2x_r0")))
 aux_auc = None
 if aux_logits:
     from sklearn.metrics import roc_auc_score

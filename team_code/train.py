@@ -129,6 +129,8 @@ def main():
                       help='Scheme D3: drop tokens of sensor-visible vehicles at random, never those of hidden vehicles.')
   parser.add_argument('--v2x_vis_keep', type=float, default=config.v2x_vis_keep, help='Keep probability for visible-vehicle tokens.')
   parser.add_argument('--v2x_hazard_range', type=float, default=config.v2x_hazard_range, help='hazard range ahead (m).')
+  parser.add_argument('--use_v2x_bev', type=int, default=config.use_v2x_bev,
+                      help='Late fusion: rasterise the received vehicle states into extra lidar-BEV channels (input level, no decoder tokens).')
   parser.add_argument('--use_v2x_adapter', type=int, default=config.use_v2x_adapter,
                       help='Scheme A: frozen-base residual adapter on the planning queries; only v2x_adapter.* is trained.')
   parser.add_argument('--v2x_adapter_layers', type=int, default=config.v2x_adapter_layers)
@@ -574,7 +576,12 @@ def main():
     load_name = str(pathlib.Path(args.load_file).stem)
     if args.continue_epoch:
       start_epoch = int(''.join(filter(str.isdigit, load_name))) + 1
-    model.load_state_dict(torch.load(args.load_file, map_location=device), strict=False)
+    sd_load = torch.load(args.load_file, map_location=device)
+    if getattr(config, 'use_v2x_bev', 0):   # fine-tuning a V2X-free base into the late-fusion model: pad the lidar stem, new channels start at zero
+      sd_load, padded = model.adapt_state_dict_for_bev_fusion(sd_load)
+      if rank == 0:
+        print('use_v2x_bev: zero-padded raster input channels in', padded)
+    model.load_state_dict(sd_load, strict=False)
 
   if getattr(config, 'use_v2x_adapter', 0):   # scheme A: everything but the adapter is the frozen base model
     for n_, p_ in model.named_parameters():
@@ -864,6 +871,11 @@ class Engine(object):
 
       coop_states = coop_mask = None
       occ_sample_weight = aux_label = aux_mask = aux_reg_label = aux_reg_mask = ts_sensor_mask = None
+      if getattr(self.config, 'use_v2x_bev', 0):   # late fusion: raster of the received states appended to the lidar BEV (penetration 1 in training)
+        bev_states = data['coop_states'].to(self.device, dtype=torch.float32); bev_mask = data['coop_mask'].to(self.device, dtype=torch.float32)
+        raster = v2x_features.rasterize_states(bev_states, bev_mask, self.config.min_x, self.config.max_x, self.config.min_y, self.config.max_y,
+                                               self.config.pixels_per_meter, self.config.v2x_bev_width)
+        lidar = torch.cat((lidar, raster), dim=1)
       if self.config.use_v2x:
         coop_states = data['coop_states'].to(self.device, dtype=torch.float32)
         coop_mask = data['coop_mask'].to(self.device, dtype=torch.float32)
