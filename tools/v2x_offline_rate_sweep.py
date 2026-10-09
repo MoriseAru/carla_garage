@@ -26,7 +26,7 @@ def load(run_dir):
 
 
 cfg_v, net_v = load(a.v2x); cfg_b, net_b = load(a.base)
-cfg_v.initialize(root_dir=[a.root], setting="all", use_v2x=1)   # dataset with coop states (augmentation kept: identical batch for every condition)
+cfg_v.initialize(root_dir=[a.root], setting="all", use_v2x=1 if not getattr(cfg_v, "use_v2x_bev", 0) else 0, use_v2x_bev=getattr(cfg_v, "use_v2x_bev", 0))   # dataset with coop states (augmentation kept: identical batch for every condition)
 if a.no_aug: cfg_v.augment_percentage = 0.0; cfg_v.use_color_aug = 0; cfg_v.lidar_aug_prob = 0.0; print("augmentation OFF", flush=True)
 ds = datamod.CARLA_Data(root=cfg_v.data_roots, config=cfg_v, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
 g = torch.Generator().manual_seed(0); idx = torch.randperm(len(ds), generator=g)[: a.n].tolist()
@@ -69,11 +69,16 @@ with torch.no_grad():
                 out = net_b(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, target_point_next=tpn)
             else:
                 if c == "v2x_r0_drop":
+                    if getattr(cfg_v, "use_v2x_bev", 0): continue      # no token memory to drop in the late-fusion model
                     net_v.coop_tokens = drop_tokens; s, m = st, torch.zeros_like(mk)
                 else:
                     net_v.coop_tokens = orig_coop_tokens; s, m = v2x_features.apply_rate(st, mk, bk, float(c.split("_r")[1].replace("_c", "")))
                     if c.endswith("_c"): s, m = compact_slots(s, m)
-                out = net_v(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, target_point_next=tpn, coop_states=s, coop_mask=m)
+                if getattr(cfg_v, "use_v2x_bev", 0):   # late-fusion model: the (gated) states enter as raster channels, not as tokens
+                    ras = v2x_features.rasterize_states(s, m, cfg_v.min_x, cfg_v.max_x, cfg_v.min_y, cfg_v.max_y, cfg_v.pixels_per_meter, getattr(cfg_v, "v2x_bev_width", 2.0))
+                    out = net_v(rgb=rgb, lidar_bev=torch.cat((lidar, ras), 1), target_point=tp, ego_vel=vel, command=cmd, target_point_next=tpn)
+                else:
+                    out = net_v(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, target_point_next=tpn, coop_states=s, coop_mask=m)
             pred_ts, pred_ckpt = out[1], out[2]
             correct[c] += (pred_ts.argmax(1) == ts_label).tolist()
             if c == "v2x_r1.0" and getattr(net_v, "_aux_logit", None) is not None: aux_logits += net_v._aux_logit.tolist(); aux_labels += occ.float().tolist()

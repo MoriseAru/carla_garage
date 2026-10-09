@@ -133,6 +133,15 @@ with torch.no_grad():
     od1t = net_d(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=mk)
     od0t = net_d(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=torch.zeros_like(mk))
 ok(float((od1t[1] - ob[1]).abs().mean()) > 1e-4, f"deep: after 15 steps rate 1 differs from base (mean |Δ logits| {float((od1t[1] - ob[1]).abs().mean()):.4f})")
-ok(torch.equal(od0t[1], ob[1]) and torch.equal(od0t[2], ob[2]), "deep: after training rate 0 is still bitwise the base")
+with torch.no_grad():
+    q0_re = net_d.v2x_join(net_d.checkpoint_query.expand(rgb.shape[0], -1, -1), store_d["memory"], st, torch.zeros_like(mk))
+    tok0, kpm0, has0 = net_d.v2x_adapter.tokens(st, torch.zeros_like(mk)); x_probe = store_d["joined"]
+    y_probe = net_d.v2x_adapter.deep_step(x_probe, 0, tok0, kpm0, has0)
+    dq = (q0_re - store_d["joined"]); print(f"deep diag: has={has0.tolist()} | q0_re vs joined: max|Δ| {float(dq.abs().max()):.3e}, NaN {int(torch.isnan(q0_re).sum())}, inf {int(torch.isinf(q0_re).sum())} | "
+          f"deep_step on zero mask: max|Δ| {float((y_probe - x_probe).abs().max()):.3e}, NaN {int(torch.isnan(y_probe).sum())} | block0 out_proj |w| {float(net_d.v2x_adapter.deep_layers[0].attn.out_proj.weight.abs().max()):.3e}", flush=True)
+ok(torch.equal(y_probe, x_probe), "deep: the trained block is a BITWISE identity for rows without a valid token (the structural guarantee)")
+ok(int(torch.isnan(q0_re).sum()) == 0 and torch.allclose(q0_re, store_d["joined"], atol=1e-5, rtol=0), "deep: re-running the frozen decoder reproduces its earlier output within float32 rounding (1e-5; cuBLAS may pick a different algorithm between calls)")
+print(f"deep: full forward at rate 0 vs base after train/eval toggling: max |Δ logits| {float((od0t[1]-ob[1]).abs().max()):.2e}, max |Δ ckpt| {float((od0t[2]-ob[2]).abs().max()):.2e} (cuDNN GRU algorithm selection can differ at the 1e-6 level)")
+ok(torch.allclose(od0t[1], ob[1], atol=1e-4) and torch.allclose(od0t[2], ob[2], atol=1e-4), "deep: after training rate 0 == base (full forward, atol 1e-4)")
 modmod.LidarCenterNet(cfg_d).load_state_dict(net_d.state_dict(), strict=True); ok(True, "deep: state_dict round-trips strict (sensor_agent loads strict)")
 print("ADAPTER SMOKE PASSED")
