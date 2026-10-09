@@ -75,6 +75,10 @@ for name, run_dir in runs.items():
                         net.v2x_adapter.collect_attn = True
                         q1 = net.v2x_join(net.checkpoint_query.expand(bs, -1, -1), q_store["memory"], st, mk); w_layers = list(net.v2x_adapter.last_attn)
                         net.v2x_adapter.collect_attn = False
+                        # per-layer share of the target-speed query's attention on VALID tokens (the six-layer mean hides which layers read)
+                        valid_f = (mk > 0.5).float(); per_layer = [float((w[:, L, 1:] * valid_f).sum(1).mean()) for w in w_layers]
+                        agg_layers = agg.setdefault("_per_layer", [0.0] * len(per_layer)); agg["_n_layer"] = agg.get("_n_layer", 0) + 1
+                        for li_, v_ in enumerate(per_layer): agg_layers[li_] += v_
                         q0 = net.v2x_join(net.checkpoint_query.expand(bs, -1, -1), q_store["memory"], st, torch.zeros_like(mk))
                         delta = q1 - q0; rel = (delta.norm(dim=-1) / q0.norm(dim=-1).clamp(min=1e-6)).mean(1)
                     else:
@@ -104,6 +108,9 @@ for name, run_dir in runs.items():
                 A["ck_valid"] += float(ck_valid[sel].sum()); A["ck_null"] += float(ck_null[sel].sum()); A["delta_rel"] += float(rel[sel].sum()); A["correct"] += int(correct[sel].sum())
                 A["per_hidden"] += float((per_slot * hidden_slot)[sel].sum()); A["n_hidden"] += int(hidden_slot[sel].sum())
                 A["per_visible"] += float((per_slot * visible_slot)[sel].sum()); A["n_visible"] += int(visible_slot[sel].sum())
+        if "_per_layer" in agg:
+            print(f"  rate {rate}: per-layer ts-query attention on valid tokens: " + " ".join(f"L{li_}={v_/agg['_n_layer']:.3f}" for li_, v_ in enumerate(agg["_per_layer"])), flush=True)
+            agg.pop("_per_layer"); agg.pop("_n_layer")
         acc[rate] = {s: dict(n=A["n"], ts_valid=A["ts_valid"] / max(A["n"], 1), ts_null=A["ts_null"] / max(A["n"], 1), ck_valid=A["ck_valid"] / max(A["n"], 1),
                              ck_null=A["ck_null"] / max(A["n"], 1), per_hidden=A["per_hidden"] / max(A["n_hidden"], 1), per_visible=A["per_visible"] / max(A["n_visible"], 1),
                              n_hidden=A["n_hidden"], n_visible=A["n_visible"], delta_rel=A["delta_rel"] / max(A["n"], 1), acc=A["correct"] / max(A["n"], 1)) for s, A in agg.items()}
