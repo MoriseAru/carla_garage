@@ -37,7 +37,7 @@ a = ap.parse_args(); dev = "cuda"; torch.manual_seed(a.seed); np.random.seed(a.s
 
 # ---------------- cache ----------------
 def load_field(name):
-    parts = [np.load(f, mmap_mode="r") for f in sorted(glob.glob(os.path.join(a.cache, f"shard*_{name}.npy")))]; assert parts, name
+    parts = [np.load(f, mmap_mode="r") for f in sorted(glob.glob(os.path.join(a.cache, f"shard[0-9][0-9]_{name}.npy")))]; assert parts, name   # shard?? exactly: shard00_index.npy must not also match shard00_teacher_index.npy
     x = np.concatenate([p[:] for p in parts], 0); return x[: a.max_frames] if a.max_frames else x
 meta = json.load(open(sorted(glob.glob(os.path.join(a.cache, "shard*_meta.json")))[0])); L, K = meta["L"], meta["K"]
 t0 = time.time(); joined = torch.from_numpy(load_field("joined")).to(dev)                       # fp16 (N, L+1, d)
