@@ -113,7 +113,12 @@ class V2XResidualAdapter(nn.Module):
   def deep_step(self, x, li, tok, kpm, has):
     """Residual read of the tokens after decoder layer `li`; exactly the identity for rows without a valid token."""
     blk = self.deep_layers[li]
-    a, _ = blk.attn(blk.ln_q(x), tok, tok, key_padding_mask=kpm, need_weights=False)
+    collect = bool(getattr(self, 'collect_attn', False))   # diagnostics (tools/v2x_attention_mass.py) set this; off in training / inference
+    a, w = blk.attn(blk.ln_q(x), tok, tok, key_padding_mask=kpm, need_weights=collect)
+    if collect:
+      if li == 0:
+        self.last_attn = []
+      self.last_attn.append(w)
     y = x + a
     y = y + blk.mlp(blk.ln_f(y))
     return x + (y - x) * has[:, None, None].to(x.dtype)

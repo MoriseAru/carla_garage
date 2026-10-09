@@ -66,13 +66,21 @@ for name, run_dir in runs.items():
                 if store is not None: store.clear()
                 out = net(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=mk) if not adapter else None
                 if adapter:
-                    # run forward with adapter attention weights: hook the adapter call
-                    net.v2x_adapter.forward.__func__  # noqa
                     q_store = {}
-                    h = net.join.register_forward_hook(lambda m, inp, o: q_store.update(joined=o.detach()))
-                    out = net(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=mk); h.remove()
-                    _ = net.v2x_adapter(q_store["joined"], st, mk, need_weights=True); w_layers = net.v2x_adapter.last_attn
-                    delta = net.v2x_adapter.last_delta; rel = (delta.norm(dim=-1) / q_store["joined"].norm(dim=-1).clamp(min=1e-6)).mean(1)   # (bs,)
+                    h = net.join.register_forward_hook(lambda m, inp, o: q_store.update(memory=inp[1].detach(), joined=o.detach()))
+                    if net.v2x_adapter.deep:
+                        # the deep path unrolls the decoder and never calls self.join: capture memory via a token-free pass, then re-run with weights collected
+                        _ = net(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd); h.remove()
+                        out = net(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=mk)
+                        net.v2x_adapter.collect_attn = True
+                        q1 = net.v2x_join(net.checkpoint_query.expand(bs, -1, -1), q_store["memory"], st, mk); w_layers = list(net.v2x_adapter.last_attn)
+                        net.v2x_adapter.collect_attn = False
+                        q0 = net.v2x_join(net.checkpoint_query.expand(bs, -1, -1), q_store["memory"], st, torch.zeros_like(mk))
+                        delta = q1 - q0; rel = (delta.norm(dim=-1) / q0.norm(dim=-1).clamp(min=1e-6)).mean(1)
+                    else:
+                        out = net(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, coop_states=st, coop_mask=mk); h.remove()
+                        _ = net.v2x_adapter(q_store["joined"], st, mk, need_weights=True); w_layers = net.v2x_adapter.last_attn
+                        delta = net.v2x_adapter.last_delta; rel = (delta.norm(dim=-1) / q_store["joined"].norm(dim=-1).clamp(min=1e-6)).mean(1)   # (bs,)
                     W = torch.stack(w_layers, 0).mean(0)                     # (bs, Lq, 1+K): null first (K when content_only: no null token)
                     valid = (mk > 0.5).float()
                     if getattr(net.v2x_adapter, "content_only", False):
