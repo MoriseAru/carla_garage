@@ -5,7 +5,7 @@ Conditions on the same frames: base model; v2x at rate 1 / .75 / .5 / .25 / 0 (m
 v2x at rate 0 with the coop tokens REMOVED from the decoder memory ("drop") instead of null-filled.
 Metrics vs expert labels: target-speed class accuracy / CE, checkpoint L1 (m), plus the coop-slot fill statistics of the data.
 """
-import argparse, os, sys, json
+import argparse, os, sys, json, math
 os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
 import numpy as np, torch, torch.nn.functional as F
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "team_code"))
@@ -37,8 +37,12 @@ print(f"frames {len(sub)} of {len(ds)}; K={cfg_v.v2x_k}", flush=True)
 # which is what the closed-loop agent does (coop_states_from_world filters, then sorts and fills from slot 0).
 # Without "_c" the silent vehicles' slots are nulled IN PLACE (slot j = j-th nearest vehicle, as in training with apply_rate).
 # Training at rate 1 only ever showed nulls at the tail, so both are out of distribution -- differently.
-conds = ["base", "v2x_r1.0", "v2x_r0.75", "v2x_r0.75_c", "v2x_r0.5", "v2x_r0.5_c", "v2x_r0.25", "v2x_r0.25_c",
+conds = ["base", "v2x_r1.0", "v2x_r1.0_rnd", "v2x_r0.75", "v2x_r0.75_c", "v2x_r0.5", "v2x_r0.5_c", "v2x_r0.25", "v2x_r0.25_c",
          "v2x_r0.1", "v2x_r0.1_c", "v2x_r0.05", "v2x_r0.05_c", "v2x_r0", "v2x_r0_drop"]
+# "v2x_r1.0_rnd" = every token present, each rotated about the ego by a random angle (offline V2X_RANDOMIZE=all): the content control.
+# Output-distance monitors (planning heads, every frame): r1 vs rnd (does content matter?), r0 vs base (is rate 0 the base?).
+dist = {k: [] for k in ("p_r1_rnd", "p_r0_base", "kl_r0_base", "ck_r1_rnd", "ck_r0_base")}
+g_rot = torch.Generator(device="cpu"); g_rot.manual_seed(1234)
 
 
 def compact_slots(states, mask):
@@ -64,6 +68,7 @@ with torch.no_grad():
         occ = ((mk * data["coop_hidden"].to(dev) * data["coop_hazard"].to(dev)).sum(1) > 0) if has_occ else torch.zeros(bs, dtype=torch.bool, device=dev)
         slow = data["slowdown"].to(dev).bool() if has_occ else (ts_label == 0)
         strata["occ"] += occ.tolist(); strata["occ_slow"] += (occ & slow).tolist(); strata["slow"] += slow.tolist(); strata["stop_label"] += (ts_label == 0).tolist()
+        keep = {}
         for c in conds:
             if c == "base":
                 out = net_b(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, target_point_next=tpn)
@@ -71,6 +76,9 @@ with torch.no_grad():
                 if c == "v2x_r0_drop":
                     if getattr(cfg_v, "use_v2x_bev", 0): continue      # no token memory to drop in the late-fusion model
                     net_v.coop_tokens = drop_tokens; s, m = st, torch.zeros_like(mk)
+                elif c == "v2x_r1.0_rnd":
+                    net_v.coop_tokens = orig_coop_tokens; m = mk
+                    s = v2x_features.rotate_states(st, (torch.rand(mk.shape, generator=g_rot) * 2 * math.pi).to(dev))
                 else:
                     net_v.coop_tokens = orig_coop_tokens; s, m = v2x_features.apply_rate(st, mk, bk, float(c.split("_r")[1].replace("_c", "")))
                     if c.endswith("_c"): s, m = compact_slots(s, m)
@@ -80,21 +88,37 @@ with torch.no_grad():
                 else:
                     out = net_v(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, target_point_next=tpn, coop_states=s, coop_mask=m)
             pred_ts, pred_ckpt = out[1], out[2]
+            if c in ("base", "v2x_r1.0", "v2x_r1.0_rnd", "v2x_r0"): keep[c] = (pred_ts.float(), pred_ckpt.float())
             correct[c] += (pred_ts.argmax(1) == ts_label).tolist()
             if c == "v2x_r1.0" and getattr(net_v, "_aux_logit", None) is not None: aux_logits += net_v._aux_logit.tolist(); aux_labels += occ.float().tolist()
             acc[c] += int((pred_ts.argmax(1) == ts_label).sum()); ce[c] += float(F.cross_entropy(pred_ts, ts_label, reduction="sum"))
             l1[c] += float((pred_ckpt - ckpt_label).abs().mean(dim=(1, 2)).sum())
+        if all(k in keep for k in ("base", "v2x_r1.0", "v2x_r1.0_rnd", "v2x_r0")):
+            P = {k: F.softmax(v[0], 1) for k, v in keep.items()}
+            dist["p_r1_rnd"] += (P["v2x_r1.0"] - P["v2x_r1.0_rnd"]).abs().sum(1).tolist()
+            dist["p_r0_base"] += (P["v2x_r0"] - P["base"]).abs().sum(1).tolist()
+            dist["kl_r0_base"] += (P["base"] * (F.log_softmax(keep["base"][0], 1) - F.log_softmax(keep["v2x_r0"][0], 1))).sum(1).tolist()
+            dist["ck_r1_rnd"] += (keep["v2x_r1.0"][1] - keep["v2x_r1.0_rnd"][1]).abs().mean(dim=(1, 2)).tolist()
+            dist["ck_r0_base"] += (keep["v2x_r0"][1] - keep["base"][1]).abs().mean(dim=(1, 2)).tolist()
         n += bs
 net_v.coop_tokens = orig_coop_tokens
 fill = np.array(fill)
 print(f"\ncoop slots: mean filled {fill.mean():.1f}/{cfg_v.v2x_k}; frames with >=1 null slot {100*any_null/n:.0f}%; frames with 0 vehicles {100*np.mean(fill==0):.1f}%; frames with <=4 vehicles {100*np.mean(fill<=4):.0f}%")
 print(f"\n{'condition':14s} {'ts acc%':>8s} {'ts CE':>7s} {'ckpt L1 m':>10s}")
+conds = [c for c in conds if len(correct[c]) == n]   # a condition skipped for this model (e.g. r0_drop on the late-fusion model) has no entries
 for c in conds: print(f"{c:14s} {100*acc[c]/n:8.1f} {ce[c]/n:7.3f} {l1[c]/n:10.3f}")
 print("\nstratified target-speed accuracy (%), frames where a CONNECTED hidden hazard exists at rate 1 (occ), occ & expert slowing, expert slowing, expert target speed = stop:")
 strat = {}
 for k, v in strata.items():
     sel = np.array(v, dtype=bool); strat[k] = {c: float(np.mean(np.array(correct[c])[sel])) if sel.sum() else float("nan") for c in conds}
-    print(f"  {k:10s} n={int(sel.sum()):5d}  " + "  ".join(f"{c}={100*strat[k][c]:5.1f}" for c in ("base", "v2x_r1.0", "v2x_r0.5", "v2x_r0.5_c", "v2x_r0.25", "v2x_r0.25_c", "v2x_r0.1_c", "v2x_r0")))
+    print(f"  {k:10s} n={int(sel.sum()):5d}  " + "  ".join(f"{c}={100*strat[k][c]:5.1f}" for c in ("base", "v2x_r1.0", "v2x_r1.0_rnd", "v2x_r0.5", "v2x_r0.5_c", "v2x_r0.25", "v2x_r0.1_c", "v2x_r0") if c in strat[k]))
+if dist["p_r1_rnd"]:
+    occ_sel = np.array(strata["occ"], dtype=bool)
+    print("\noutput distances (planning heads): sum|Δp| over target-speed classes, KL(base || model), mean |Δcheckpoint| m")
+    for k, v in dist.items():
+        v = np.array(v); print(f"  {k:11s} all {v.mean():.4f}   occ {v[occ_sel].mean() if occ_sel.any() else float('nan'):.4f}")
+    print(f"  CONTENT GAP (occ frames, accuracy r1 − rnd): {100*(strat['occ']['v2x_r1.0'] - strat['occ']['v2x_r1.0_rnd']):+.1f} pt;  "
+          f"R0 GAP (all frames, accuracy r0 − base): {100*(acc['v2x_r0'] - acc['base'])/n:+.1f} pt")
 aux_auc = None
 if aux_logits:
     from sklearn.metrics import roc_auc_score

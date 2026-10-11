@@ -129,6 +129,13 @@ def main():
                       help='Scheme D3: drop tokens of sensor-visible vehicles at random, never those of hidden vehicles.')
   parser.add_argument('--v2x_vis_keep', type=float, default=config.v2x_vis_keep, help='Keep probability for visible-vehicle tokens.')
   parser.add_argument('--v2x_hazard_range', type=float, default=config.v2x_hazard_range, help='hazard range ahead (m).')
+  parser.add_argument('--v2x_teacher_plugin', type=str, default=config.v2x_teacher_plugin,
+                      help='Scheme R: run dir of the frozen co-trained plug-in; token samples get KD to it at the same gated tokens.')
+  parser.add_argument('--v2x_teacher_base', type=str, default=config.v2x_teacher_base,
+                      help='Scheme R: run dir of the frozen base; zero-token samples get KD to it instead of the imitation planning loss.')
+  parser.add_argument('--v2x_kd_T', type=float, default=config.v2x_kd_T, help='Scheme R: distillation temperature (target speed).')
+  parser.add_argument('--v2x_kd_w', type=float, default=config.v2x_kd_w, help='Scheme R: weight of each KD term, relative to the planning losses.')
+  parser.add_argument('--save_every', type=int, default=0, help='>0: also keep model/optimizer files every N epochs (monitoring).')
   parser.add_argument('--use_v2x_bev', type=int, default=config.use_v2x_bev,
                       help='Late fusion: rasterise the received vehicle states into extra lidar-BEV channels (input level, no decoder tokens).')
   parser.add_argument('--use_v2x_adapter', type=int, default=config.use_v2x_adapter,
@@ -532,6 +539,9 @@ def main():
     factor = 1.0 / sum(config.detailed_loss_weights.values())
     for k in config.detailed_loss_weights:
       config.detailed_loss_weights[k] = config.detailed_loss_weights[k] * factor
+    if config.v2x_teacher_plugin or config.v2x_teacher_base:   # scheme R: same normalised scale as loss_target_speed / loss_checkpoint
+      for k in ('loss_kd_tok_ts', 'loss_kd_tok_ck', 'loss_kd_zero_ts', 'loss_kd_zero_ck'):
+        config.detailed_loss_weights[k] = float(args.v2x_kd_w) * factor
 
   # Data, configures config. Create before the model
   train_set = CARLA_Data(root=config.data_roots,
@@ -717,6 +727,23 @@ def main():
                    scheduler=scheduler,
                    scaler=scaler)
 
+  trainer.teachers = {}
+  for role, run_dir in (('plugin', config.v2x_teacher_plugin), ('base', config.v2x_teacher_base)):
+    if run_dir:   # frozen, eval, perception heads skipped at forward time (planning outputs only)
+      with open(os.path.join(run_dir, 'config.json'), 'rt', encoding='utf-8') as f:
+        t_cfg = GlobalConfig(); t_cfg.__dict__.update(jsonpickle.decode(f.read()).__dict__)
+      t_ck = sorted(fn for fn in os.listdir(run_dir) if fn.startswith('model_') and fn.endswith('.pth'))[-1]
+      t_net = LidarCenterNet(t_cfg)
+      if t_cfg.sync_batch_norm:
+        t_net = torch.nn.SyncBatchNorm.convert_sync_batchnorm(t_net)
+      t_net.load_state_dict(torch.load(os.path.join(run_dir, t_ck), map_location='cpu'), strict=True)
+      t_cfg.use_semantic = t_cfg.use_bev_semantic = t_cfg.use_depth = t_cfg.detect_boxes = 0
+      t_net.to(device).eval().requires_grad_(False)
+      assert bool(getattr(t_cfg, 'use_v2x', 0)) == (role == 'plugin'), f'teacher {role} has use_v2x={getattr(t_cfg, "use_v2x", 0)}'
+      trainer.teachers[role] = t_net
+      if rank == 0:
+        print(f'scheme R teacher {role}: {run_dir}/{t_ck} (strict load, frozen)')
+
   for epoch in range(trainer.cur_epoch, args.epochs):
     print(f'Epoch {epoch}, learning rate: ', scheduler.get_last_lr())
     # Update the seed depending on the epoch so that the distributed
@@ -786,6 +813,28 @@ class Engine(object):
       pathlib.Path(self.vis_save_path).mkdir(parents=True, exist_ok=True)
 
     self.detailed_loss_weights = config.detailed_loss_weights
+
+  def kd_losses(self, tok_sel, rgb, lidar, target_point, target_point_next, ego_vel, command, coop_states, coop_mask, s_ts, s_ck):
+    """Scheme R distillation on the planning heads (target-speed logits at temperature T, checkpoints L1).
+    Token samples -> frozen co-trained plug-in at the SAME gated tokens; zero-token samples -> frozen base. Each teacher
+    only runs on its own subset. An empty subset contributes an exact zero (still attached to the graph for DDP)."""
+    T = float(self.config.v2x_kd_T); out = {}
+    for name, sel, role in (('tok', tok_sel, 'plugin'), ('zero', ~tok_sel, 'base')):
+      teacher = self.teachers.get(role)
+      if teacher is None or not bool(sel.any()):
+        out[f'loss_kd_{name}_ts'] = 0.0 * s_ts.sum(); out[f'loss_kd_{name}_ck'] = 0.0 * s_ck.sum()
+        continue
+      kw = dict(rgb=rgb[sel], lidar_bev=lidar[sel], target_point=target_point[sel], ego_vel=ego_vel[sel], command=command[sel],
+                target_point_next=target_point_next[sel] if self.config.two_tp_input else None)
+      if role == 'plugin':
+        kw.update(coop_states=coop_states[sel], coop_mask=coop_mask[sel])
+      with torch.no_grad():
+        t_out = teacher(**kw)
+      t_ts, t_ck = t_out[1].float().detach(), t_out[2].float().detach()
+      st_, sc_ = s_ts[sel].float(), s_ck[sel].float()
+      out[f'loss_kd_{name}_ts'] = F.kl_div(F.log_softmax(st_ / T, 1), F.softmax(t_ts / T, 1), reduction='batchmean') * T * T
+      out[f'loss_kd_{name}_ck'] = (sc_ - t_ck).abs().mean()
+    return out
 
   def load_data_compute_loss(self, data, validation=False):
     # Validation = True will compute additional metrics not used for optimization
@@ -910,6 +959,11 @@ class Engine(object):
           # the sensor head is supervised on every frame exactly once: rate-0 frames through the routed output,
           # token-bearing frames through the second (null-token) decoder pass
           ts_sensor_mask = (coop_mask.sum(1) > 0).float()
+        kd_on = bool(getattr(self, 'teachers', None)) and not validation
+        if kd_on:   # scheme R: imitation planning loss on token samples only; zero-token samples are supervised by the base teacher
+          tok_sel = coop_mask.sum(1) > 0
+          w_tok = tok_sel.float()
+          occ_sample_weight = w_tok / w_tok.mean().clamp(min=1e-6)
       pred_wp,\
       pred_target_speed,\
       pred_checkpoint,\
@@ -973,6 +1027,9 @@ class Engine(object):
                             aux_reg_label=aux_reg_label,
                             aux_reg_mask=aux_reg_mask,
                             ts_sensor_mask=ts_sensor_mask)
+      if self.config.use_v2x and not validation and getattr(self, 'teachers', None):
+        losses.update(self.kd_losses(tok_sel, rgb, lidar, target_point, target_point_next, ego_vel, command, coop_states, coop_mask,
+                                     pred_target_speed, pred_checkpoint))
 
     # Compute metrics for logging
     metrics = {}
@@ -1149,6 +1206,8 @@ class Engine(object):
           # so we keep the models from the end of the epochs number 6, 14, 30
           # (epoch number 6 means it's the 7th epoch because we count from)
           keep_prev_epoch = True
+      if getattr(self.args, 'save_every', 0) and self.cur_epoch % int(self.args.save_every) == 0:
+        keep_prev_epoch = True   # epoch cur_epoch-1 is a monitoring checkpoint (every save_every epochs)
       last_model_file = os.path.join(self.args.logdir, f'model_{self.cur_epoch - 1:04d}.pth')
       last_optimizer_file = os.path.join(self.args.logdir, f'optimizer_{self.cur_epoch - 1:04d}.pth')
       last_scaler_file = os.path.join(self.args.logdir, f'scaler_{self.cur_epoch - 1:04d}.pth')

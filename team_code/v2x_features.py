@@ -155,6 +155,19 @@ def unmatched_detections(sender_xy, det_xy, match_dist=2.5):
     return int((d2.min(axis=1) > match_dist ** 2).sum())
 
 
+def rotate_states(states, angles):
+    """Batched counterpart of rotate_about_ego on normalised _state() rows: states (..., 7), angles (...) in radians.
+    Position (x/32, y/32), velocity (vx/10, vy/10) and heading (cos, sin) rotate together; length is unchanged.
+    Offline version of V2X_RANDOMIZE=all (the content control): token present and plausible, position wrong."""
+    c, s = torch.cos(angles), torch.sin(angles)
+    out = states.clone()
+    for i, j in ((0, 1), (2, 3), (4, 5)):
+        a, b = states[..., i], states[..., j]
+        out[..., i] = c * a - s * b
+        out[..., j] = s * a + c * b
+    return out
+
+
 def route_use_base(history, thresh):
     """Availability router: True = fall back to the V2X-free base model. `history` is a deque of per-frame
     kept/in_radius ratios (frames with no vehicle in radius contribute nothing). Undecidable (empty history) -> False,

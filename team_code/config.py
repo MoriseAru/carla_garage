@@ -856,6 +856,13 @@ class GlobalConfig:
     self.v2x_adapter_calib = 0          # 1: token-free calibration residual trained first (tokens off) and frozen; rate 0 == base + calib
     self.v2x_adapter_aux = 0            # 1: training-only aux head (nearest hidden hazard state) inside the adapter
     self.v2x_adapter_init_std = 0.0     # >0: non-zero init of the residual output projections
+    # Scheme R ("reverse t3", 2026-10-11): fine-tune the CO-TRAINED plug-in (keeps its content reading) and teach it the
+    # base model's behaviour on zero-token samples. Token samples: imitation + KD to the frozen plug-in at the same gated
+    # tokens (anchor); zero-token samples: KD to the frozen base (planning heads) instead of imitation. Empty = off.
+    self.v2x_teacher_plugin = ''
+    self.v2x_teacher_base = ''
+    self.v2x_kd_T = 2.0
+    self.v2x_kd_w = 1.0          # weight of each KD term relative to (normalised) loss_target_speed / loss_checkpoint
     self.v2x_adapter_deep = 0            # 1: gated cross-attention block after EVERY decoder layer (Flamingo-style) instead of one block on the decoder output
     self.v2x_adapter_res_gain = 0       # 1: learnable per-layer scalar gain on the token residual
     self.v2x_adapter_content_only = 0   # 1: residual is a function of token contents only (no null token / slot embedding / biases; MLP on the attention output)
