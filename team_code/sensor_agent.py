@@ -36,6 +36,8 @@ import jsonpickle
 import jsonpickle.ext.numpy as jsonpickle_numpy
 import ujson  # Like json but faster
 import gzip
+import pickle
+import time
 
 jsonpickle_numpy.register_handlers()
 jsonpickle.set_encoder_options('json', sort_keys=True, indent=4)
@@ -190,6 +192,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     # message arrived (see v2x_features.SelfTokenTracker). V2X_SELF_SPEED: track (deployable, default) | gt (diagnostic:
     # speed of the nearest true vehicle within 2.5 m, privileged) | zero. The diagnostics below compare every self-token
     # with the simulator's ground truth -- logging only, never fed to the model.
+    # V2X_SELF_MIN_HITS (default 5): detections a track needs before it emits a token (see SelfTokenTracker.min_hits).
+    # V2X_SELF_DUMP=<dir>: write the per-step ego pose, ground truth and detections for tools/v2x_selftoken_replay.py.
     self.v2x_self = None
     if int(os.environ.get('V2X_SELF', 0)):
       assert getattr(self.config, 'use_v2x', 0), 'V2X_SELF needs a token model (use_v2x=1)'
@@ -197,12 +201,15 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           'V2X_SELF needs the detection head every frame (detect_boxes=1 and STOP_CONTROL=1, the default)'
       self.v2x_self = v2x_features.SelfTokenTracker(dt=self.config.carla_frame_rate,
                                                      gate=float(os.environ.get('V2X_SELF_GATE', 2.5)),
-                                                     max_miss=int(os.environ.get('V2X_SELF_MAX_MISS', 2)))
+                                                     max_miss=int(os.environ.get('V2X_SELF_MAX_MISS', 2)),
+                                                     min_hits=int(os.environ.get('V2X_SELF_MIN_HITS', 5)))
       self.v2x_self_speed = os.environ.get('V2X_SELF_SPEED', 'track')
+      self.v2x_self_dump = [] if os.environ.get('V2X_SELF_DUMP') else None
       assert self.v2x_self_speed in ('track', 'gt', 'zero'), self.v2x_self_speed
       self.v2x_self_diag = dict(frames=0, tokens=0, matched=0, pos_err=[], spd_err=[], yaw_err=[], yaw_flip=0, added=0,
                                 suppressed=0, vis_gt=0, vis_covered=0, hid_gt=0, hid_covered=0, kept_self_frames=0)
       print(f"V2X self-tokens ON: speed={self.v2x_self_speed} gate={self.v2x_self.gate} max_miss={self.v2x_self.max_miss} "
+            f"min_hits={self.v2x_self.min_hits} "
             f"dt={self.v2x_self.dt}", flush=True)
     self.v2x_ego_pose = None
 
@@ -378,6 +385,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     extra = None
     if self.v2x_self is not None:
       extra = self.v2x_self_tokens(ego_matrix, ego_yaw, live, lidar)
+      if self.v2x_self_dump is not None:   # V2X_SELF_DUMP: raw per-frame record for offline tracker replay (tools/v2x_selftoken_replay.py)
+        self.v2x_self_dump.append(dict(step=self.step, ego_matrix=ego_matrix, ego_yaw=ego_yaw, dets=None,
+                                       gt=[(r[0], r[1], r[2], r[3], r[4], r[5]) for r in live.values()]))
     stats = {}
     states, mask = v2x_features.coop_states_from_world(
         ego_matrix, ego_yaw, vehicles, k=self.config.v2x_k, rate=rate, radius=self.config.v2x_radius,
@@ -782,6 +792,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       self.bb_buffer.append(bbs_vehicle_coordinate_system)
       if self.v2x_self is not None and self.v2x_ego_pose is not None:
         self.v2x_self.update(bbs_vehicle_coordinate_system, self.v2x_ego_pose[0], self.v2x_ego_pose[1], self.step)
+        if self.v2x_self_dump and self.v2x_self_dump[-1]['step'] == self.step:
+          self.v2x_self_dump[-1]['dets'] = [np.asarray(bb, dtype=np.float64) for bb in bbs_vehicle_coordinate_system]
     else:
       bbs_vehicle_coordinate_system = None
 
@@ -1036,6 +1048,10 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     if getattr(self, 'v2x_self', None) is not None:
       print('V2X_SELF_SUMMARY ' + self.v2x_self_summary(), flush=True)
+      if self.v2x_self_dump:
+        dump_dir = pathlib.Path(os.environ['V2X_SELF_DUMP']); dump_dir.mkdir(parents=True, exist_ok=True)
+        with gzip.open(dump_dir / f'selfdump_{time.strftime("%Y%m%d_%H%M%S")}_{os.getpid()}.pkl.gz', 'wb') as f:
+          pickle.dump(self.v2x_self_dump, f)
 
     del self.nets
     del self.config

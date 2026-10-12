@@ -326,8 +326,15 @@ class SelfTokenTracker:
     (forward speed < -flip_speed) is taken to have a 180-degree heading error and is flipped: vehicles do not reverse in
     these routes (0 reversing boxes among 2743 in the 2026-10-11 token check)."""
 
-    def __init__(self, dt=0.05, gate=2.5, max_miss=2, window=10, min_pts=3, classes=(0, 4), flip_speed=1.0):
+    def __init__(self, dt=0.05, gate=2.5, max_miss=2, window=10, min_pts=3, classes=(0, 4), flip_speed=1.0, min_hits=1):
         self.dt, self.gate, self.max_miss, self.window, self.min_pts = dt, gate, max_miss, window, min_pts
+        # min_hits: a track emits tokens only after this many associated detections. A new track has speed 0 for its first
+        # min_pts-1 frames and a 1-2 m/s error for a few more; offline, speed-0 tokens hurt more than no token (85.1 vs
+        # 91.5), so a car entering view is better absent for 0.2 s than present at speed 0. Closed-loop replay of 8 target45
+        # routes (2026-10-13, tools/v2x_selftoken_replay.py): min_hits 5 -> |speed err| p90 1.91 -> 1.77, p99 7.96 -> 4.02,
+        # 5% fewer tokens. The p90 floor is set by the detector (along-heading centre noise ~0.25 m, white): shorter
+        # windows, quadratic fits and Kalman filters do not get below ~1.7.
+        self.min_hits = min_hits
         self.classes, self.flip_speed = tuple(classes), flip_speed
         self.tracks = {}
         self.next_id = 0
@@ -388,6 +395,8 @@ class SelfTokenTracker:
         out = []
         for tid, tr in self.tracks.items():
             if step - tr["last"] > self.max_miss + 1:     # +1: tokens of frame t+1 come from detections up to frame t
+                continue
+            if tr["hits"] < self.min_hits:
                 continue
             wx, wy = self._predict_xy(tr, step)
             x, y = world_to_ego(ego_matrix, wx, wy)
