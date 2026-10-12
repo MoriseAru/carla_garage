@@ -186,6 +186,26 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       print(f"V2X availability router ON: base={base_ckpt} thresh={self.route_thresh} window={self.route_window} "
             f"denom={os.environ.get('V2X_ROUTE_DENOM', 'oracle')}")
 
+    # Self-tokens (V2X_SELF=1): the ego's own vehicle detections, tracked over frames, fill the token set wherever no
+    # message arrived (see v2x_features.SelfTokenTracker). V2X_SELF_SPEED: track (deployable, default) | gt (diagnostic:
+    # speed of the nearest true vehicle within 2.5 m, privileged) | zero. The diagnostics below compare every self-token
+    # with the simulator's ground truth -- logging only, never fed to the model.
+    self.v2x_self = None
+    if int(os.environ.get('V2X_SELF', 0)):
+      assert getattr(self.config, 'use_v2x', 0), 'V2X_SELF needs a token model (use_v2x=1)'
+      assert self.config.detect_boxes and self.stop_sign_controller, \
+          'V2X_SELF needs the detection head every frame (detect_boxes=1 and STOP_CONTROL=1, the default)'
+      self.v2x_self = v2x_features.SelfTokenTracker(dt=self.config.carla_frame_rate,
+                                                     gate=float(os.environ.get('V2X_SELF_GATE', 2.5)),
+                                                     max_miss=int(os.environ.get('V2X_SELF_MAX_MISS', 2)))
+      self.v2x_self_speed = os.environ.get('V2X_SELF_SPEED', 'track')
+      assert self.v2x_self_speed in ('track', 'gt', 'zero'), self.v2x_self_speed
+      self.v2x_self_diag = dict(frames=0, tokens=0, matched=0, pos_err=[], spd_err=[], yaw_err=[], yaw_flip=0, added=0,
+                                suppressed=0, vis_gt=0, vis_covered=0, hid_gt=0, hid_covered=0, kept_self_frames=0)
+      print(f"V2X self-tokens ON: speed={self.v2x_self_speed} gate={self.v2x_self.gate} max_miss={self.v2x_self.max_miss} "
+            f"dt={self.v2x_self.dt}", flush=True)
+    self.v2x_ego_pose = None
+
     self.stuck_detector = 0
     self.force_move = 0
 
@@ -354,6 +374,10 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     else:
       vehicles = list(live.values())
     rate = float(env.get('V2X_RATE', self.config.v2x_rate))
+    self.v2x_ego_pose = (ego_matrix, ego_yaw)        # the frame the detections of THIS step will be expressed in
+    extra = None
+    if self.v2x_self is not None:
+      extra = self.v2x_self_tokens(ego_matrix, ego_yaw, live, lidar)
     stats = {}
     states, mask = v2x_features.coop_states_from_world(
         ego_matrix, ego_yaw, vehicles, k=self.config.v2x_k, rate=rate, radius=self.config.v2x_radius,
@@ -362,8 +386,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         pos_noise=float(env.get('V2X_POS_NOISE', 0.0)), vel_noise=float(env.get('V2X_VEL_NOISE', 0.0)),
         drop=float(env.get('V2X_DROP', 0.0)), rng=self.v2x_rng,
         randomize=env.get('V2X_RANDOMIZE', 'none'), salt=int(env.get('V2X_SEED', 0)),
-        bucket_salt=int(env.get('V2X_SEED', 0)) if int(env.get('V2X_BUCKET_SALT', 0)) else 0, stats=stats)
+        bucket_salt=int(env.get('V2X_SEED', 0)) if int(env.get('V2X_BUCKET_SALT', 0)) else 0, stats=stats,
+        extra_tokens=extra, extra_match_dist=float(env.get('V2X_MATCH_DIST', 2.5)))
     self.v2x_stats = stats
+    if self.v2x_self is not None:
+      self.v2x_self_diag['added'] += stats['self_added']
+      self.v2x_self_diag['suppressed'] += stats['self_suppressed']
+      self.v2x_self_diag['kept_self_frames'] += int(stats['self_added'] > 0)
     denom = env.get('V2X_ROUTE_DENOM', 'oracle')
     if denom == 'detected':
       # deployable proxy: ego-perceived cars (class 0) from the previous frame that match no received message
@@ -384,8 +413,60 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
             + (f" | router[{env.get('V2X_ROUTE_DENOM', 'oracle')}]: avail {sum(self.v2x_avail)/max(len(self.v2x_avail),1):.2f} "
                f"(oracle {sum(self.v2x_oracle_avail)/max(len(self.v2x_oracle_avail),1):.2f}, unmatched-det {stats.get('unmatched_det', '-')}) thresh {self.route_thresh} "
                f"-> {'BASE' if self.route_to_base else 'plug-in'} (base frames {self.route_base_frames}/{self.step + 1})"
-               if self.base_nets else ""), flush=True)
+               if self.base_nets else "")
+            + (f" | self: in {stats.get('self_in')} added {stats.get('self_added')} suppressed {stats.get('self_suppressed')}; "
+               + self.v2x_self_summary() if self.v2x_self is not None else ""), flush=True)
     return states.to(self.device), mask.to(self.device)
+
+  def v2x_self_tokens(self, ego_matrix, ego_yaw, live, lidar):
+    """Self-tokens for this step from the tracker (detections up to the previous step), plus ground-truth diagnostics."""
+    toks = self.v2x_self.tokens(ego_matrix, ego_yaw, self.step)
+    d = self.v2x_self_diag
+    d['frames'] += 1
+    # ground truth of this step, ego frame (privileged; diagnostics and the V2X_SELF_SPEED=gt mode only)
+    gt = []
+    for rec in live.values():
+      rel = t_u.get_relative_transform(ego_matrix, rec[1])
+      gt.append((float(rel[0]), float(rel[1]), v2x_features.wrap_angle(rec[2] - ego_yaw), float(rec[3]), rel, rec[5]))
+    out = []
+    for (x, y, ryaw, spd, length, _) in toks:
+      j, dmin = -1, 1e9
+      for i, g in enumerate(gt):
+        dd = math.hypot(g[0] - x, g[1] - y)
+        if dd < dmin:
+          j, dmin = i, dd
+      d['tokens'] += 1
+      if j >= 0 and dmin <= 2.5:
+        g = gt[j]
+        d['matched'] += 1
+        d['pos_err'].append(dmin); d['spd_err'].append(spd - g[3])
+        ye = abs(v2x_features.wrap_angle(ryaw - g[2])); d['yaw_err'].append(ye); d['yaw_flip'] += int(ye > math.pi / 2)
+        if self.v2x_self_speed == 'gt':
+          spd = g[3]
+      if self.v2x_self_speed == 'zero':
+        spd = 0.0
+      out.append((x, y, ryaw, spd, length))
+    # coverage: true vehicles inside the detection range, split by ego-lidar visibility (> V2X_HIDDEN_PTS hits = visible)
+    hidden_pts = int(os.environ.get('V2X_HIDDEN_PTS', getattr(self.config, 'v2x_hidden_pts', 5)))
+    for g in gt:
+      if not (self.config.min_x < g[0] < self.config.max_x and self.config.min_y < g[1] < self.config.max_y):
+        continue
+      covered = any(math.hypot(t[0] - g[0], t[1] - g[1]) <= 2.5 for t in toks)
+      npts = v2x_features.points_in_box(np.asarray(g[4][:3], dtype=np.float64), g[2], g[5], lidar)
+      key = 'hid' if 0 <= npts <= hidden_pts else 'vis'
+      d[key + '_gt'] += 1; d[key + '_covered'] += int(covered)
+    return out
+
+  def v2x_self_summary(self):
+    d = self.v2x_self_diag
+    med = lambda v, q=50: float(np.percentile(v, q)) if len(v) else float('nan')
+    return (f"frames {d['frames']} tokens {d['tokens']} matched {d['matched'] / max(d['tokens'], 1):.3f} "
+            f"pos_err med {med(d['pos_err']):.2f} p90 {med(d['pos_err'], 90):.2f} m; "
+            f"spd_err med {med(d['spd_err']):+.2f} |p90| {med(np.abs(d['spd_err']), 90):.2f} m/s; "
+            f"yaw_err med {np.degrees(med(d['yaw_err'])):.1f} deg flip {d['yaw_flip']}; "
+            f"recall vis {d['vis_covered'] / max(d['vis_gt'], 1):.3f} hid {d['hid_covered'] / max(d['hid_gt'], 1):.3f}; "
+            f"added {d['added']} suppressed {d['suppressed']} frames-with-self {d['kept_self_frames']}; "
+            f"tracker heading flips {self.v2x_self.n_flipped}")
 
   def sensors(self):
     sensors = [{
@@ -699,6 +780,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       bbs_vehicle_coordinate_system = t_u.non_maximum_suppression(bounding_boxes, self.config.iou_treshold_nms)
 
       self.bb_buffer.append(bbs_vehicle_coordinate_system)
+      if self.v2x_self is not None and self.v2x_ego_pose is not None:
+        self.v2x_self.update(bbs_vehicle_coordinate_system, self.v2x_ego_pose[0], self.v2x_ego_pose[1], self.step)
     else:
       bbs_vehicle_coordinate_system = None
 
@@ -950,6 +1033,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
             ujson.dump(self.tp_attention_buffer, f, indent=4)
 
         del self.tp_attention_buffer
+
+    if getattr(self, 'v2x_self', None) is not None:
+      print('V2X_SELF_SUMMARY ' + self.v2x_self_summary(), flush=True)
 
     del self.nets
     del self.config

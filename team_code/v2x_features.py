@@ -9,6 +9,7 @@ as the detection labels); closed-loop reads them from the CARLA world through th
 """
 import math
 import zlib
+from collections import deque
 
 import numpy as np
 import torch
@@ -200,7 +201,7 @@ def select_delayed(history, latency_frames):
 
 def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius=64.0, relative_transform=None,
                            lidar=None, hidden_pts=5, tokens="all", pos_noise=0.0, vel_noise=0.0, drop=0.0, rng=None,
-                           randomize="none", salt=0, bucket_salt=0, stats=None):
+                           randomize="none", salt=0, bucket_salt=0, stats=None, extra_tokens=None, extra_match_dist=2.5):
     """Closed-loop counterpart. `vehicles` = iterable of (actor_id, actor_matrix(4x4), yaw_rad, speed, length[, extent(3,)]);
     `relative_transform(ego_matrix, actor_matrix)` must be team_code.transfuser_utils.get_relative_transform so the
     frame matches the recorded boxes exactly. Returns torch tensors (1,k,7), (1,k).
@@ -214,7 +215,12 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
               message matters' from 'a token being there matters'.
     `stats` (dict) receives counts: total, in_radius (all vehicles within radius), sending (whose message arrived),
     hidden, kept (tokens given to the model), dropped, randomized, and sender_xy (ego-frame positions of the arrived
-    messages). bucket_salt: 0 = historical hash; >0 = a different silent set per eval seed."""
+    messages). bucket_salt: 0 = historical hash; >0 = a different silent set per eval seed.
+    extra_tokens: self-tokens (V2X_SELF) -- list of (x, y, ryaw, speed, length) in the ego frame built from the ego's own
+              detections. Each one farther than `extra_match_dist` m from the TRUE position of every message token kept
+              this frame is added to the candidate set (nearest-K over messages + self-tokens together); the others are
+              suppressed because that vehicle is already represented by its message. Counters: self_in, self_added,
+              self_suppressed."""
     rng = rng if rng is not None else np.random.default_rng()
     cands = []
     # Counters (all vehicles within `radius`, whether or not they send):
@@ -223,8 +229,9 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
     #   kept      = tokens actually handed to the model (after the hidden/visible filter and the K-slot cap)
     # The penetration gate must come AFTER the in_radius count -- 2026-09-20 it came before, so in_radius only counted
     # senders and sending/in_radius was 1.0 at every penetration rate; the router never fired.
-    st = dict(total=0, in_radius=0, sending=0, hidden=0, kept=0, dropped=0, randomized=0)
+    st = dict(total=0, in_radius=0, sending=0, hidden=0, kept=0, dropped=0, randomized=0, self_in=0, self_added=0, self_suppressed=0)
     sender_xy = []
+    msg_true_xy = []     # true positions of the message tokens that survive the tokens filter (dedup reference for self-tokens)
     need_vis = (tokens != "all") or (randomize in ("hidden", "visible"))
     for veh in vehicles:
         aid, mat, yaw, spd, length = veh[:5]
@@ -251,6 +258,7 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
             st["hidden"] += int(hid)
             if (tokens == "hidden" and not hid) or (tokens == "visible" and hid):
                 continue
+        msg_true_xy.append((x, y))
         if randomize != "none" and (randomize == "all" or (randomize == "hidden") == hid):
             x, y, ryaw = rotate_about_ego(x, y, ryaw, rotation_angle(aid, salt))
             st["randomized"] += 1
@@ -258,6 +266,16 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
             x += float(rng.normal(0.0, pos_noise)); y += float(rng.normal(0.0, pos_noise))
         spd = float(spd) + (float(rng.normal(0.0, vel_noise)) if vel_noise > 0.0 else 0.0)
         cands.append((dist, _state(x, y, ryaw, max(0.0, spd), float(length))))
+    for (ex, ey, eyaw, espd, elen) in (extra_tokens or []):
+        st["self_in"] += 1
+        edist = math.hypot(ex, ey)
+        if edist > radius:
+            continue
+        if any((ex - mx) ** 2 + (ey - my) ** 2 <= extra_match_dist ** 2 for mx, my in msg_true_xy):
+            st["self_suppressed"] += 1
+            continue
+        st["self_added"] += 1
+        cands.append((edist, _state(float(ex), float(ey), float(eyaw), max(0.0, float(espd)), float(elen))))
     cands.sort(key=lambda t: t[0])
     states = np.zeros((k, STATE_DIM), dtype=np.float32)
     mask = np.zeros((k,), dtype=np.float32)
@@ -268,3 +286,116 @@ def coop_states_from_world(ego_matrix, ego_yaw, vehicles, k=16, rate=1.0, radius
         stats.update(st)
         stats["sender_xy"] = sender_xy
     return torch.from_numpy(states)[None], torch.from_numpy(mask)[None]
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# Self-tokens (V2X_SELF=1): fill the token set with the ego's OWN vehicle detections, so that "no message from a vehicle"
+# no longer looks like "no vehicle there". Messages still win wherever they exist (dedup in coop_states_from_world).
+# The TF++ detection head of these models predicts no velocity (lidar_seq_len = seq_len = 1 -> velocity output is 0), so
+# speed has to come from tracking the detections over frames. Detections of frame t are only available AFTER the forward
+# pass of frame t, so the tokens of frame t+1 are the tracks propagated by one step -- the same one-frame lag a real
+# stack would have.
+# ---------------------------------------------------------------------------------------------------------------------
+def ego_to_world(ego_matrix, x, y, z=0.0):
+    """Inverse of transfuser_utils.get_relative_transform (rel = R^T (p - e)  ->  p = e + R rel). Returns world (x, y)."""
+    m = np.asarray(ego_matrix, dtype=np.float64)
+    p = m[:3, 3] + m[:3, :3] @ np.array([x, y, z], dtype=np.float64)
+    return float(p[0]), float(p[1])
+
+
+def world_to_ego(ego_matrix, wx, wy, wz=None):
+    """get_relative_transform for a bare world point; wz defaults to the ego's own height (detections carry no z)."""
+    m = np.asarray(ego_matrix, dtype=np.float64)
+    wz = m[2, 3] if wz is None else wz
+    r = m[:3, :3].T @ (np.array([wx, wy, wz], dtype=np.float64) - m[:3, 3])
+    return float(r[0]), float(r[1])
+
+
+def wrap_angle(a):
+    return math.atan2(math.sin(a), math.cos(a))
+
+
+class SelfTokenTracker:
+    """Nearest-neighbour tracker over the ego's vehicle detections, in world coordinates.
+    update(dets, ego_matrix, ego_yaw, step): dets = boxes in the ego frame of `step`, TF++ layout
+        [x, y, extent_x, extent_y, yaw, speed, brake, class, score] (convert_features_to_bb_metric + NMS output).
+    tokens(ego_matrix, ego_yaw, step): list of (x, y, ryaw, speed, length, track_id) in the CURRENT ego frame, every track
+        seen within the last `max_miss` frames, propagated to `step` with its estimated velocity.
+    Speed = least-squares velocity over the last `window` positions (needs >= `min_pts`, else 0), projected on the detected
+    heading (training tokens carry forward speed). A track that clearly moves against its detected heading
+    (forward speed < -flip_speed) is taken to have a 180-degree heading error and is flipped: vehicles do not reverse in
+    these routes (0 reversing boxes among 2743 in the 2026-10-11 token check)."""
+
+    def __init__(self, dt=0.05, gate=2.5, max_miss=2, window=10, min_pts=3, classes=(0, 4), flip_speed=1.0):
+        self.dt, self.gate, self.max_miss, self.window, self.min_pts = dt, gate, max_miss, window, min_pts
+        self.classes, self.flip_speed = tuple(classes), flip_speed
+        self.tracks = {}
+        self.next_id = 0
+        self.n_flipped = 0      # token-frames emitted with a flipped heading (not tracks)
+
+    def _velocity(self, tr):
+        h = tr["hist"]
+        if len(h) < self.min_pts:
+            return 0.0, 0.0
+        t = np.array([r[0] for r in h], dtype=np.float64) * self.dt
+        t = t - t.mean()
+        den = float((t ** 2).sum())
+        if den <= 0.0:
+            return 0.0, 0.0
+        x = np.array([r[1] for r in h]); y = np.array([r[2] for r in h])
+        return float((t * (x - x.mean())).sum() / den), float((t * (y - y.mean())).sum() / den)
+
+    def _predict_xy(self, tr, step):
+        vx, vy = tr["v"]
+        lag = (step - tr["last"]) * self.dt
+        return tr["hist"][-1][1] + vx * lag, tr["hist"][-1][2] + vy * lag
+
+    def update(self, dets, ego_matrix, ego_yaw, step):
+        obs = []
+        for bb in dets or []:
+            if int(round(float(bb[7]))) not in self.classes:
+                continue
+            wx, wy = ego_to_world(ego_matrix, float(bb[0]), float(bb[1]))
+            obs.append((wx, wy, wrap_angle(float(bb[4]) + ego_yaw), 2.0 * float(bb[2])))
+        live = [tid for tid, tr in self.tracks.items() if step - tr["last"] <= self.max_miss + 1]
+        pairs = []
+        for tid in live:
+            px, py = self._predict_xy(self.tracks[tid], step)
+            for j, o in enumerate(obs):
+                d = math.hypot(o[0] - px, o[1] - py)
+                if d <= self.gate:
+                    pairs.append((d, tid, j))
+        pairs.sort()
+        used_t, used_o = set(), set()
+        for d, tid, j in pairs:                           # greedy nearest-first association
+            if tid in used_t or j in used_o:
+                continue
+            used_t.add(tid); used_o.add(j)
+            tr = self.tracks[tid]
+            tr["hist"].append((step, obs[j][0], obs[j][1])); tr["yaw"], tr["len"] = obs[j][2], obs[j][3]
+            tr["last"], tr["hits"] = step, tr["hits"] + 1
+            tr["v"] = self._velocity(tr)
+        for j, o in enumerate(obs):
+            if j in used_o:
+                continue
+            self.tracks[self.next_id] = dict(hist=deque([(step, o[0], o[1])], maxlen=self.window), yaw=o[2], len=o[3],
+                                             last=step, hits=1, v=(0.0, 0.0))
+            self.next_id += 1
+        for tid in [t for t, tr in self.tracks.items() if step - tr["last"] > self.max_miss]:
+            del self.tracks[tid]
+
+    def tokens(self, ego_matrix, ego_yaw, step):
+        out = []
+        for tid, tr in self.tracks.items():
+            if step - tr["last"] > self.max_miss + 1:     # +1: tokens of frame t+1 come from detections up to frame t
+                continue
+            wx, wy = self._predict_xy(tr, step)
+            x, y = world_to_ego(ego_matrix, wx, wy)
+            vx, vy = tr["v"]
+            yaw = tr["yaw"]
+            fwd = vx * math.cos(yaw) + vy * math.sin(yaw)
+            if fwd < -self.flip_speed:
+                yaw, fwd = wrap_angle(yaw + math.pi), -fwd
+                self.n_flipped += 1
+            out.append((x, y, wrap_angle(yaw - ego_yaw), max(0.0, fwd), tr["len"], tid))
+        return out
