@@ -337,6 +337,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     Inference-time message model, all via environment variables (defaults = training condition):
       V2X_RATE            penetration (hash-gated per actor id; default config.v2x_rate)
       V2X_TOKENS          all | hidden | visible   (hidden = <= V2X_HIDDEN_PTS ego-lidar hits in the vehicle's box, default 5)
+      V2X_HIDDEN_LIDAR    full (default since 2026-10-13: 360-degree cloud, as the training num_points) | half (historical:
+                          current half sweep only -- the hid / vis / rndhid / rndvis runs before fork commit of 10/13 used it)
       V2X_POS_NOISE       Gaussian position noise on the reported state (m);  V2X_VEL_NOISE (m/s)
       V2X_DROP            per-message loss probability per frame
       V2X_LATENCY_FRAMES  use each vehicle's state from N frames ago (20 Hz -> 4 frames = 200 ms); not yet received -> no token
@@ -716,7 +718,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     # V2XState plug-in: connected vehicles' ground-truth states from the simulator (privileged, by design of the premise)
     coop_states = coop_mask = None
     if getattr(self.config, 'use_v2x', 0) or getattr(self.config, 'use_v2x_bev', 0):
-      coop_states, coop_mask = self.v2x_states(lidar=tick_data.get('lidar'))   # ego-frame lidar for the hidden/visible filter
+      # Lidar for the hidden/visible filter. The training flag (num_points in boxes/*.json.gz) is counted on the 360-degree
+      # cloud (data_agent.py: current half + aligned last half). tick_data['lidar'] is only the current HALF sweep (lidar
+      # 10 Hz, sim 20 Hz), so before 2026-10-13 roughly half of the visible vehicles had 0 hits every frame and were
+      # flagged hidden, alternating with the scanned side. V2X_HIDDEN_LIDAR=half reproduces that historical behaviour.
+      hid_lidar = tick_data.get('lidar')
+      if os.environ.get('V2X_HIDDEN_LIDAR', 'full') == 'full' and self.config.backbone not in ('aim'):
+        hid_lidar = lidar_full
+      coop_states, coop_mask = self.v2x_states(lidar=hid_lidar)
     if getattr(self.config, 'use_v2x_bev', 0):   # late fusion: the same message model, rasterised into the lidar BEV channels
       raster = v2x_features.rasterize_states(coop_states, coop_mask, self.config.min_x, self.config.max_x, self.config.min_y, self.config.max_y,
                                              self.config.pixels_per_meter, getattr(self.config, 'v2x_bev_width', 2.0))
