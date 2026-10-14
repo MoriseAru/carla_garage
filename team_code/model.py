@@ -344,10 +344,23 @@ class LidarCenterNet(nn.Module):
           # + 1 for the target speed token
           self.checkpoint_query = nn.Parameter(
               torch.zeros(1, self.config.predict_checkpoint_len + 1, self.config.gru_input_size))
-          self.checkpoint_decoder = GRUWaypointsPredictorInterFuser(input_dim=self.config.gru_input_size,
-                                                                    hidden_size=self.config.gru_hidden_size,
-                                                                    waypoints=self.config.predict_checkpoint_len,
-                                                                    target_point_size=target_point_size)
+          if getattr(self.config, 'use_bridgedrive', 0):
+            # BridgeDrive: the 10 checkpoint queries become the ego queries of the diffusion-bridge head; the GRU is not built
+            from bridgedrive_head import BridgeDriveHead   # pylint: disable=import-outside-toplevel
+            self.bridgedrive_head = BridgeDriveHead(
+                num_poses=self.config.predict_checkpoint_len, d_model=self.config.bridgedrive_d_model,
+                d_ffn=self.config.bridgedrive_d_ffn, num_heads=self.config.bridgedrive_num_head, dropout=self.config.bridgedrive_dropout,
+                in_bev_dims=self.backbone.num_features, max_x=self.config.max_x, max_y=self.config.max_y,
+                anchor_path=self.config.bridgedrive_anchor_path, stats_path=self.config.bridgedrive_stats_path,
+                step_num=self.config.bridgedrive_step_num, num_layers=self.config.bridgedrive_num_layers,
+                zero_last_y=bool(self.config.bridgedrive_zero_last_y), swap_xy=bool(getattr(self.config, 'bridgedrive_bev_swap_xy', 0)),
+                num_anchors=int(getattr(self.config, 'bridgedrive_num_anchors', 60)))
+            assert self.config.bridgedrive_d_model == self.config.gru_input_size, 'ego queries must have the head width'
+          else:
+            self.checkpoint_decoder = GRUWaypointsPredictorInterFuser(input_dim=self.config.gru_input_size,
+                                                                      hidden_size=self.config.gru_hidden_size,
+                                                                      waypoints=self.config.predict_checkpoint_len,
+                                                                      target_point_size=target_point_size)
 
         self.reset_parameters()
 
@@ -486,7 +499,7 @@ class LidarCenterNet(nn.Module):
     return torch.where(coop_mask[..., None] > 0.5, tok, null)
 
   def forward(self, rgb, lidar_bev, target_point, ego_vel, command, target_point_next=None, coop_states=None, coop_mask=None,
-              also_sensor_only=False):
+              also_sensor_only=False, checkpoint_label=None):
     bs = rgb.shape[0]
     self._aux_logit = None   # hidden-hazard auxiliary prediction (scheme C), read by compute_loss
     self._aux_reg = None     # nearest connected hidden hazard state regression (scheme C+)
@@ -511,6 +524,7 @@ class LidarCenterNet(nn.Module):
     pred_wp_1 = None
     selected_path = None
 
+    bev_map = fused_features   # (bs, num_features, H, W) raw fused BEV map: grid-sampled by the BridgeDrive head
     if self.config.use_wp_gru or self.config.use_controller_input_prediction:
       if self.config.transformer_decoder_join:
         fused_features = self.change_channel(fused_features)
@@ -585,7 +599,12 @@ class LidarCenterNet(nn.Module):
           if self.config.use_v2x and getattr(self.config, 'use_v2x_aux_reg', 0):
             self._aux_reg = self.hidden_reg_head(target_speed_features)
 
-          pred_checkpoint = self.checkpoint_decoder(gru_features, target_point)
+          if getattr(self.config, 'use_bridgedrive', 0):
+            # train mode: dict(poses_cls_list, best_reg) from one noisy bridge sample; eval mode: (bs, 10, 2) sampled trajectory
+            assert not self.config.input_path_to_target_speed_network, 'input_path_to_target_speed_network is not supported with the BridgeDrive head'
+            pred_checkpoint = self.bridgedrive_head(gru_features, bev_map, gt_checkpoints=checkpoint_label)
+          else:
+            pred_checkpoint = self.checkpoint_decoder(gru_features, target_point)
           if self.config.input_path_to_target_speed_network:
             ts_input = torch.cat(
                 (target_speed_features, pred_checkpoint.reshape(bs, self.config.predict_checkpoint_len * 2)), axis=1)
@@ -674,6 +693,11 @@ class LidarCenterNet(nn.Module):
                                  label_smoothing=self.loss_speed.label_smoothing, reduction='none')
         loss_target_speed = torch.mean(per_ts * sample_weight)
         loss_wp = torch.mean(torch.mean(torch.abs(pred_checkpoint - checkpoint_label), dim=(1, 2)) * sample_weight)
+      elif isinstance(pred_checkpoint, dict):   # BridgeDrive head in train mode
+        loss_target_speed = self.loss_speed(pred_target_speed, target_speed_label)
+        loss_cls, loss_reg = self.bridgedrive_head.compute_loss(pred_checkpoint, checkpoint_label)
+        loss.update({'loss_ddbm_cls': loss_cls, 'loss_ddbm_reg': loss_reg})
+        loss_wp = torch.mean(torch.abs(pred_checkpoint['best_reg'] - checkpoint_label)).detach()   # monitoring only (weight 0)
       else:
         loss_target_speed = self.loss_speed(pred_target_speed, target_speed_label)
         loss_wp = torch.mean(torch.abs(pred_checkpoint - checkpoint_label))

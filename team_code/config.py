@@ -488,6 +488,8 @@ class GlobalConfig:
         'loss_wp': 1.0,
         'loss_target_speed': 1.0,
         'loss_checkpoint': 1.0,
+        'loss_ddbm_reg': 0.0,   # BridgeDrive head (use_bridgedrive): set to 1.0 by train.py, loss_checkpoint -> 0
+        'loss_ddbm_cls': 0.0,
         'loss_semantic': 1.0,
         'loss_bev_semantic': 1.0,
         'loss_depth': 1.0,
@@ -847,6 +849,21 @@ class GlobalConfig:
     # Late fusion (input level): the received vehicle states are rasterised into extra lidar-BEV channels (v2x_features.rasterize_states)
     # and go through the lidar backbone together with the point histogram. use_v2x_bev is independent of use_v2x (decoder tokens).
     self.use_v2x_bev = 0
+    # BridgeDrive (ICLR 2026) planning head on TF++: anchor-guided diffusion bridge replaces the GRU checkpoint decoder.
+    # team_code/bridgedrive_head.py; recipe = post-train the finished base checkpoint, everything trainable (released
+    # LEAD adaptation: scripts/posttrain_bridgedrive.sh). Target speed stays on the TF++ head (diffusion_speed=false).
+    self.use_bridgedrive = 0
+    self.bridgedrive_anchor_path = ''      # (K, 10, 2) k-means centres of the expert checkpoints, metres (tools/bridgedrive_anchors.py)
+    self.bridgedrive_stats_path = ''       # (2, 10, 2) per-point mean / std of the expert checkpoints (same tool)
+    self.bridgedrive_step_num = 20         # ODE steps at inference
+    self.bridgedrive_num_layers = 2        # decoder layers (regression and classification stacks)
+    self.bridgedrive_d_model = 256
+    self.bridgedrive_d_ffn = 1024
+    self.bridgedrive_num_head = 8
+    self.bridgedrive_dropout = 0.0         # attention dropout (tf_dropout); the block dropout 0.1 is fixed in the head
+    self.bridgedrive_zero_last_y = 1       # reference inference quirk: y of the last checkpoint forced to 0 at every ODE step
+    self.bridgedrive_num_anchors = 60      # K; only used to size the placeholder when the anchor file is absent (checkpoint restores it)
+    self.bridgedrive_bev_swap_xy = 0       # grid_sample layout: 0 = this fork's BEV (col = x forward, row = y right); 1 = reference (LEAD) layout
     self.v2x_bev_channels = 3      # occupancy, vx/10, vy/10
     self.v2x_bev_width = 2.0       # assumed vehicle width (m); the message carries the length only
     self.use_v2x_adapter = 0

@@ -136,6 +136,11 @@ def main():
   parser.add_argument('--v2x_kd_T', type=float, default=config.v2x_kd_T, help='Scheme R: distillation temperature (target speed).')
   parser.add_argument('--v2x_kd_w', type=float, default=config.v2x_kd_w, help='Scheme R: weight of each KD term, relative to the planning losses.')
   parser.add_argument('--save_every', type=int, default=0, help='>0: also keep model/optimizer files every N epochs (monitoring).')
+  parser.add_argument('--use_bridgedrive', type=int, default=config.use_bridgedrive,
+                      help='BridgeDrive: anchor-guided diffusion-bridge checkpoint head instead of the GRU (post-train from a base checkpoint).')
+  parser.add_argument('--bridgedrive_anchor_path', type=str, default=config.bridgedrive_anchor_path)
+  parser.add_argument('--bridgedrive_stats_path', type=str, default=config.bridgedrive_stats_path)
+  parser.add_argument('--bridgedrive_step_num', type=int, default=config.bridgedrive_step_num)
   parser.add_argument('--use_v2x_bev', type=int, default=config.use_v2x_bev,
                       help='Late fusion: rasterise the received vehicle states into extra lidar-BEV channels (input level, no decoder tokens).')
   parser.add_argument('--use_v2x_adapter', type=int, default=config.use_v2x_adapter,
@@ -524,6 +529,10 @@ def main():
 
   if config.multi_wp_output:
     config.detailed_loss_weights['loss_selection'] = 1.0
+  if config.use_bridgedrive:   # the diffusion head supervises the checkpoints (reference: raw weights 1.0 each, normalised with the rest)
+    config.detailed_loss_weights['loss_ddbm_reg'] = 1.0
+    config.detailed_loss_weights['loss_ddbm_cls'] = 1.0
+    config.detailed_loss_weights['loss_checkpoint'] = 0.0
 
   if args.learn_multi_task_weights:
     for k in config.detailed_loss_weights:
@@ -615,7 +624,7 @@ def main():
   if bool(args.sync_batch_norm):
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
   find_unused_parameters = False
-  if config.use_plant:
+  if config.use_plant or config.use_bridgedrive:   # BridgeDrive: layer-0 regression branch and the reg-stack cls branches get no gradient (as in the reference)
     find_unused_parameters = True
   model = torch.nn.parallel.DistributedDataParallel(model,
                                                     device_ids=None,
@@ -980,7 +989,8 @@ class Engine(object):
                           target_point_next=target_point_next if self.config.two_tp_input else None,
                           coop_states=coop_states,
                           coop_mask=coop_mask,
-                          also_sensor_only=bool(getattr(self.config, 'v2x_dual_head', 0)) and not validation)
+                          also_sensor_only=bool(getattr(self.config, 'v2x_dual_head', 0)) and not validation,
+                          checkpoint_label=checkpoint if getattr(self.config, 'use_bridgedrive', 0) else None)
     else:
       raise ValueError('The chosen vision backbone does not exist. The options are: transFuser, aim, bev_encoder')
 
