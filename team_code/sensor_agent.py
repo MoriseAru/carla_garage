@@ -153,6 +153,14 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         if self.config.compile or self.compile:
           net = torch.compile(net, mode=self.config.compile_mode)
 
+        if getattr(self.config, 'use_bridgedrive', 0) and os.environ.get('BD_ZERO_LAST_Y', '') != '':
+          # BridgeDrive reference quirk (y of the last checkpoint forced to 0 at every ODE step): 1 = as the released
+          # code / config.json, 0 = off. Offline (2026-10-16) the quirk costs 0.149 vs 0.034 m ADE; closed loop decides.
+          net.bridgedrive_head.zero_last_y = bool(int(os.environ['BD_ZERO_LAST_Y']))
+          print(f"BridgeDrive: zero_last_y overridden by BD_ZERO_LAST_Y -> {net.bridgedrive_head.zero_last_y}", flush=True)
+        if getattr(self.config, 'use_bridgedrive', 0):
+          print(f"BridgeDrive head: anchors {tuple(net.bridgedrive_head.plan_anchor.shape)}, steps {net.bridgedrive_head.step_num}, "
+                f"zero_last_y {net.bridgedrive_head.zero_last_y}, swap_xy {net.bridgedrive_head.diff_decoder[0].cross_bev_attention.swap_xy}", flush=True)
         self.nets.append(net)
 
     # Availability router (V2X_ROUTE_THRESH > 0): a second, V2X-free model that takes over on frames where too few of

@@ -16,6 +16,7 @@ import config as cfgmod, model as modmod, data as datamod
 ap = argparse.ArgumentParser(); ap.add_argument("--root", required=True); ap.add_argument("--bd", required=True); ap.add_argument("--base", required=True)
 ap.add_argument("--n", type=int, default=3000); ap.add_argument("--bs", type=int, default=16); ap.add_argument("--seeds", type=int, default=3)
 ap.add_argument("--out", default="/work/gn21/n21001/V2XState_Real/tmp/bridgedrive_offline.json")
+ap.add_argument("--zero_last_y", type=int, default=-1, help="override the head's zero_last_y flag (-1: as in the checkpoint's config)")
 a = ap.parse_args(); dev = "cuda"
 
 
@@ -29,6 +30,7 @@ def load(run_dir):
 cfg_d, net_d = load(a.bd); cfg_b, net_b = load(a.base)
 assert getattr(cfg_d, "use_bridgedrive", 0), "--bd must be a BridgeDrive checkpoint"
 head = net_d.bridgedrive_head
+if a.zero_last_y >= 0: head.zero_last_y = bool(a.zero_last_y); print(f"zero_last_y overridden -> {head.zero_last_y}", flush=True)
 print(f"head: anchors {tuple(head.plan_anchor.shape)}, steps {head.step_num}, zero_last_y {head.zero_last_y}, swap_xy {head.diff_decoder[0].cross_bev_attention.swap_xy}; "
       f"anchor first-point distance {torch.linalg.norm(head.plan_anchor[:, 0], dim=-1).min():.2f}-{torch.linalg.norm(head.plan_anchor[:, 0], dim=-1).max():.2f} m; "
       f"stats mean x[0] {head.mean[0, 0, 0, 0]:.3f} std x[0] {head.std[0, 0, 0, 0]:.3f}", flush=True)
@@ -38,7 +40,7 @@ ds = datamod.CARLA_Data(root=cfg_b.data_roots, config=cfg_b, estimate_class_dist
 g = torch.Generator().manual_seed(0); idx = torch.randperm(len(ds), generator=g)[: a.n].tolist()
 dl = torch.utils.data.DataLoader(torch.utils.data.Subset(ds, idx), batch_size=a.bs, shuffle=False, num_workers=16)
 P = cfg_b.predict_checkpoint_len
-acc = {"base": [], "bd": []}; ade = {"base": [], "bd": [], "bd_anchor": [], "oracle_anchor": []}; fde = {"base": [], "bd": []}
+acc = {"base": [], "bd": []}; ade = {"base": [], "bd": [], "bd_anchor": [], "oracle_anchor": []}; fde = {"base": [], "bd": []}; perpt = {"base": [], "bd": []}
 cls_acc = []; spread = []; n = 0
 with torch.no_grad():
   for data in dl:
@@ -54,7 +56,7 @@ with torch.no_grad():
     pc_b, pc_d = ob[2].float(), samples[0]
     acc["base"] += (ob[1].argmax(1) == ts_label).tolist(); acc["bd"] += (od[1].argmax(1) == ts_label).tolist()
     for k, pc in (("base", pc_b), ("bd", pc_d)):
-      d = torch.linalg.norm(pc - route, dim=-1); ade[k] += d.mean(1).tolist(); fde[k] += d[:, -1].tolist()
+      d = torch.linalg.norm(pc - route, dim=-1); ade[k] += d.mean(1).tolist(); fde[k] += d[:, -1].tolist(); perpt[k].append(d.mean(0).cpu())
     if a.seeds > 1:
       st = torch.stack(samples); spread += torch.linalg.norm(st - st.mean(0, keepdim=True), dim=-1).mean(-1).std(0).tolist()
     # anchor classification: run the cls stack once (same as inside forward_test)
@@ -74,6 +76,7 @@ with torch.no_grad():
 res = dict(n=n, ts_acc={k: float(np.mean(v)) for k, v in acc.items()}, ade={k: float(np.mean(v)) for k, v in ade.items()}, fde={k: float(np.mean(v)) for k, v in fde.items()},
            cls_acc=float(np.mean(cls_acc)), spread=float(np.mean(spread)) if spread else None)
 print(f"\nframes {n}")
+for k in perpt: print(f"  per-checkpoint error (m) {k:4s}: " + " ".join(f"{v:.3f}" for v in torch.stack(perpt[k]).mean(0).tolist()))
 print(f"  checkpoint ADE (m): base GRU {res['ade']['base']:.3f}, bridgedrive {res['ade']['bd']:.3f};  FDE: base {res['fde']['base']:.3f}, bridgedrive {res['fde']['bd']:.3f}")
 print(f"  anchors: classification accuracy {100 * res['cls_acc']:.1f} %; ADE of the chosen anchor before refinement {res['ade']['bd_anchor']:.3f}, of the label-nearest anchor {res['ade']['oracle_anchor']:.3f}")
 print(f"  target-speed accuracy: base {100 * res['ts_acc']['base']:.1f}, bridgedrive {100 * res['ts_acc']['bd']:.1f}" + (f";  sampling spread (ADE std over {a.seeds} samplings) {res['spread']:.3f} m" if spread else ""))
