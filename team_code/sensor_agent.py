@@ -203,6 +203,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     # V2X_SELF_MIN_HITS (default 5): detections a track needs before it emits a token (see SelfTokenTracker.min_hits).
     # V2X_SELF_DUMP=<dir>: write the per-step ego pose, ground truth and detections for tools/v2x_selftoken_replay.py.
     self.v2x_self = None
+    if os.environ.get('V2X_RADIUS', '') != '':   # inference-only override of the message radius (training used config.v2x_radius)
+      print(f"V2X: message radius overridden by V2X_RADIUS -> {float(os.environ['V2X_RADIUS'])} m (config {self.config.v2x_radius})", flush=True)
     if int(os.environ.get('V2X_SELF', 0)):
       assert getattr(self.config, 'use_v2x', 0), 'V2X_SELF needs a token model (use_v2x=1)'
       assert self.config.detect_boxes and self.stop_sign_controller, \
@@ -400,7 +402,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
                                        gt=[(r[0], r[1], r[2], r[3], r[4], r[5]) for r in live.values()]))
     stats = {}
     states, mask = v2x_features.coop_states_from_world(
-        ego_matrix, ego_yaw, vehicles, k=self.config.v2x_k, rate=rate, radius=self.config.v2x_radius,
+        ego_matrix, ego_yaw, vehicles, k=self.config.v2x_k, rate=rate, radius=float(env.get('V2X_RADIUS', self.config.v2x_radius)),
         relative_transform=t_u.get_relative_transform, lidar=lidar,
         hidden_pts=int(env.get('V2X_HIDDEN_PTS', getattr(self.config, 'v2x_hidden_pts', 5))), tokens=env.get('V2X_TOKENS', 'all'),
         pos_noise=float(env.get('V2X_POS_NOISE', 0.0)), vel_noise=float(env.get('V2X_VEL_NOISE', 0.0)),
