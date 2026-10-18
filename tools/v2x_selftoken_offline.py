@@ -85,6 +85,11 @@ SIG = [float(x) for x in a.spd_noise.replace(":", ",").split(",") if x]   # ":" 
 conds += [f"r0_self_n{sg:g}" for sg in SIG]
 rng_spd = np.random.default_rng(0)
 acc = {c: [] for c in conds}; l1 = {c: [] for c in conds}; kl = {c: [] for c in conds}; occ_all = []; nself = {c: [] for c in conds}
+spd = {c: [] for c in conds}; lab_spd = []; lead_all = []   # decoded target speed (closed-loop rule) per condition; expert label; lead-vehicle frames
+TS = torch.tensor(cfg_v.target_speeds, dtype=torch.float32)
+def decode_speed(logits):
+  pr = torch.softmax(logits.float().cpu(), 1)
+  return torch.where(pr[:, 0] > float(cfg_v.brake_uncertainty_threshold), torch.zeros(pr.shape[0]), (pr * TS).sum(1))
 det = dict(n_det=0, matched=0, pos=[], yaw=[], flip=0, length=[], vis_gt=0, vis_hit=0, hid_gt=0, hid_hit=0, gt_spd_of_matched=[])
 indep_max = 0.0; n = 0
 with torch.no_grad():
@@ -96,6 +101,8 @@ with torch.no_grad():
         ckpt_label = data["route"][:, : cfg_v.predict_checkpoint_len].to(dev, dtype=torch.float32)
         st = data["coop_states"].float(); mk = data["coop_mask"].float(); bk = data["coop_bucket"]; hid = data["coop_hidden"].float()
         occ = ((mk * hid * data["coop_hazard"].float()).sum(1) > 0); occ_all += occ.tolist(); bs = rgb.shape[0]
+        lead = ((mk > 0.5) & (st[..., 0] * 32 > 0) & (st[..., 0] * 32 <= 20) & ((st[..., 1] * 32).abs() <= 2.5)).any(1); lead_all += lead.tolist()   # a car ahead in the ego lane within 20 m
+        lab_spd += (data["target_speed_twohot"].float() * TS[None]).sum(1).tolist()
         kw = dict(rgb=rgb, lidar_bev=lidar, target_point=tp, ego_vel=vel, command=cmd, target_point_next=tpn)
         out_r1 = net_v(**kw, coop_states=st.to(dev), coop_mask=mk.to(dev))
         out_r0 = net_v(**kw, coop_states=st.to(dev), coop_mask=torch.zeros_like(mk).to(dev))
@@ -149,7 +156,7 @@ with torch.no_grad():
         lb = F.log_softmax(outs["base"][1].float(), 1)
         for c in conds:
             p = outs[c][1].float()
-            acc[c] += (p.argmax(1) == ts_label).tolist()
+            acc[c] += (p.argmax(1) == ts_label).tolist(); spd[c] += decode_speed(p).tolist()
             l1[c] += (outs[c][2].float() - ckpt_label).abs().mean(dim=(1, 2)).tolist()
             kl[c] += (lb.exp() * (lb - F.log_softmax(p, 1))).sum(1).tolist()
         n += bs
@@ -172,6 +179,15 @@ for c in conds:
     A = np.array(acc[c], dtype=float)
     res[c] = dict(acc=A.mean(), occ=A[occ_all].mean() if occ_all.any() else float("nan"), l1=float(np.mean(l1[c])), kl=float(np.mean(kl[c])), tok=float(np.mean(nself[c])))
     print(f"   {c:15s} {100*res[c]['acc']:8.1f} {100*res[c]['occ']:9.1f} {res[c]['l1']:8.3f} {res[c]['kl']:12.4f} {res[c]['tok']:13.1f}")
+lead_all = np.array(lead_all, dtype=bool); LS = np.array(lab_spd)
+print(f"\nD) decoded target speed (closed-loop rule: P(stop) > {cfg_v.brake_uncertainty_threshold} -> 0, else expectation), m/s: mean / mean(pred - expert) / over-speed rate (pred > expert + 2 m/s)")
+print(f"   expert label mean: all {LS.mean():.2f}, lead-vehicle frames (n={int(lead_all.sum())}) {LS[lead_all].mean():.2f}, occ frames (n={int(occ_all.sum())}) {LS[occ_all].mean():.2f}")
+for c in conds:
+  P = np.array(spd[c]); row = []
+  for nm, sel in (("all", np.ones_like(lead_all)), ("lead", lead_all), ("occ", occ_all)):
+    d = P[sel] - LS[sel]; row.append(f"{nm} {P[sel].mean():5.2f} / {d.mean():+5.2f} / {100*np.mean(d > 2.0):4.1f}%")
+    res[c][f"spd_{nm}"] = float(P[sel].mean()); res[c][f"dspd_{nm}"] = float(d.mean()); res[c][f"over_{nm}"] = float(np.mean(d > 2.0))
+  print(f"   {c:15s} " + ";  ".join(row))
 print(f"\n  R0 GAP (acc - base): v2x_r0 {100*(res['v2x_r0']['acc']-res['base']['acc']):+.1f} pt; r0_self_gtspd {100*(res['r0_self_gtspd']['acc']-res['base']['acc']):+.1f} pt; "
       f"r0_self_zero {100*(res['r0_self_zero']['acc']-res['base']['acc']):+.1f} pt; r0_vis32 {100*(res['r0_vis32']['acc']-res['base']['acc']):+.1f} pt")
 json.dump(dict(n=n, indep_max=indep_max, det={k: (v if not isinstance(v, list) else dict(median=med(v), p90=med(v, 90), n=len(v))) for k, v in det.items()}, cond=res),
