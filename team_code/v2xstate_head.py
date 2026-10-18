@@ -178,7 +178,8 @@ class V2XStateHead(nn.Module):
     x = F.relu(self.bn3_1(self.conv3_1(x)))
     context = torch.cat((x.mean(dim=(2, 3)), self.target_encoder(target_point.float()), state_context), dim=1)
     checkpoints = self.mlp_head(context).view(bs, self.traj_points, 2)
-    out = dict(checkpoints=checkpoints, gate=gate, attention=attention[:, 0], basis=basis)
+    # occupancy / state are returned for logging only (closed-loop consistency dumps); nothing reads them back
+    out = dict(checkpoints=checkpoints, gate=gate, attention=attention[:, 0], basis=basis, occupancy=occupancy, state=state)
     if self.training:
       with torch.autocast(device_type=bev_feature.device.type, enabled=False):   # logs / KL in fp32
         g = gate.detach().float()   # as the original: the mask loss shapes the basis maps only
