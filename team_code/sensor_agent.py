@@ -629,6 +629,35 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     return result
 
   @torch.inference_mode()  # Turns off gradient computation
+  def _v2xs_dump_step(self, net, tick_data, lidar_bev, velocity, coop_states, coop_mask, pred_checkpoint):
+    """V2XS_DUMP=<dir>: per-step record of the V2XState head's inputs / gate for LOCAL's closed-loop consistency check
+    (MIYABI 10/18 22:13, items 1-6). Every 100th step also stores the full model inputs for an offline recompute."""
+    from srunner.scenariomanager.carla_data_provider import CarlaDataProvider  # pylint: disable=import-outside-toplevel
+    if not hasattr(self, '_v2xs_records'):
+      self._v2xs_records, self._v2xs_inputs = [], []
+    v = net._v2xs
+    ego = CarlaDataProvider.get_hero_actor()
+    em = np.array(ego.get_transform().get_matrix())
+    vehicles = []
+    for a in CarlaDataProvider.get_all_actors().filter('vehicle.*'):
+      if a.id == ego.id:
+        continue
+      r = em[:3, :3].T @ (np.array(a.get_transform().get_matrix())[:3, 3] - em[:3, 3])
+      vehicles.append((float(r[0]), float(r[1])))
+    f16 = lambda t: t.detach().float().cpu().numpy().astype(np.float16)
+    self._v2xs_records.append(dict(step=self.step, gate=f16(v['gate'][0]), state=v['state'][0].detach().float().cpu().numpy(),
+                                   occupancy=f16(v['occupancy'][0]), attention=f16(v['attention'][0]),
+                                   target_point=tick_data['target_point'][0].detach().cpu().numpy(), speed=float(velocity.item()),
+                                   command=tick_data['command'][0].detach().cpu().numpy(), vehicles=vehicles,
+                                   checkpoint=pred_checkpoint[0].detach().float().cpu().numpy()))
+    if self.step % 100 == 0 and len(self._v2xs_inputs) < 5:
+      cpu = lambda t: None if t is None else t.detach().cpu()
+      self._v2xs_inputs.append(dict(step=self.step, rgb=cpu(tick_data['rgb']), lidar_bev=cpu(lidar_bev),
+                                    target_point=cpu(tick_data['target_point']),
+                                    target_point_next=cpu(tick_data.get('target_point_next')), ego_vel=cpu(velocity),
+                                    command=cpu(tick_data['command']), coop_states=cpu(coop_states), coop_mask=cpu(coop_mask),
+                                    checkpoint=cpu(pred_checkpoint)))
+
   def run_step(self, input_data, timestamp, sensors=None):  # pylint: disable=locally-disabled, unused-argument
     self.step += 1
 
@@ -777,6 +806,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
           command=tick_data['command'],
           coop_states=coop_states,
           coop_mask=coop_mask)
+        if i == 0 and os.environ.get('V2XS_DUMP') and getattr(nets[i], '_v2xs', None) is not None:
+          self._v2xs_dump_step(nets[i], tick_data, lidar_bev, velocity, coop_states, coop_mask, pred_checkpoint)
         # Only convert bounding boxes when they are used.
         if self.config.detect_boxes and (compute_debug_output or self.config.backbone in ('aim') or
                                          self.stop_sign_controller):
@@ -1064,6 +1095,13 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
             ujson.dump(self.tp_attention_buffer, f, indent=4)
 
         del self.tp_attention_buffer
+
+    if os.environ.get('V2XS_DUMP') and getattr(self, '_v2xs_records', None):
+      d = pathlib.Path(os.environ['V2XS_DUMP']); d.mkdir(parents=True, exist_ok=True)
+      tag = time.strftime('%Y%m%d_%H%M%S') + f'_{os.getpid()}'
+      with gzip.open(d / f'v2xs_{tag}.pkl.gz', 'wb') as fh:
+        pickle.dump(self._v2xs_records, fh)
+      torch.save(self._v2xs_inputs, d / f'v2xs_inputs_{tag}.pt')
 
     if getattr(self, 'v2x_self', None) is not None:
       print('V2X_SELF_SUMMARY ' + self.v2x_self_summary(), flush=True)
