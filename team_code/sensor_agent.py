@@ -628,7 +628,6 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
 
     return result
 
-  @torch.inference_mode()  # Turns off gradient computation
   def _v2xs_dump_step(self, net, tick_data, lidar_bev, velocity, coop_states, coop_mask, pred_checkpoint):
     """V2XS_DUMP=<dir>: per-step record of the V2XState head's inputs / gate for LOCAL's closed-loop consistency check
     (MIYABI 10/18 22:13, items 1-6). Every 100th step also stores the full model inputs for an offline recompute."""
@@ -658,6 +657,7 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
                                     command=cpu(tick_data['command']), coop_states=cpu(coop_states), coop_mask=cpu(coop_mask),
                                     checkpoint=cpu(pred_checkpoint)))
 
+  @torch.inference_mode()  # Turns off gradient computation
   def run_step(self, input_data, timestamp, sensors=None):  # pylint: disable=locally-disabled, unused-argument
     self.step += 1
 
