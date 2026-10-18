@@ -85,7 +85,7 @@ SIG = [float(x) for x in a.spd_noise.replace(":", ",").split(",") if x]   # ":" 
 conds += [f"r0_self_n{sg:g}" for sg in SIG]
 rng_spd = np.random.default_rng(0)
 acc = {c: [] for c in conds}; l1 = {c: [] for c in conds}; kl = {c: [] for c in conds}; occ_all = []; nself = {c: [] for c in conds}
-spd = {c: [] for c in conds}; lab_spd = []; lead_all = []   # decoded target speed (closed-loop rule) per condition; expert label; lead-vehicle frames
+spd_rec = {c: [] for c in conds}; lab_spd = []; lead_all = []   # decoded target speed (closed-loop rule) per condition; expert label; lead-vehicle frames
 TS = torch.tensor(cfg_v.target_speeds, dtype=torch.float32)
 def decode_speed(logits):
   pr = torch.softmax(logits.float().cpu(), 1)
@@ -156,7 +156,7 @@ with torch.no_grad():
         lb = F.log_softmax(outs["base"][1].float(), 1)
         for c in conds:
             p = outs[c][1].float()
-            acc[c] += (p.argmax(1) == ts_label).tolist(); spd[c] += decode_speed(p).tolist()
+            acc[c] += (p.argmax(1) == ts_label).tolist(); spd_rec[c] += decode_speed(p).tolist()
             l1[c] += (outs[c][2].float() - ckpt_label).abs().mean(dim=(1, 2)).tolist()
             kl[c] += (lb.exp() * (lb - F.log_softmax(p, 1))).sum(1).tolist()
         n += bs
@@ -183,7 +183,7 @@ lead_all = np.array(lead_all, dtype=bool); LS = np.array(lab_spd)
 print(f"\nD) decoded target speed (closed-loop rule: P(stop) > {cfg_v.brake_uncertainty_threshold} -> 0, else expectation), m/s: mean / mean(pred - expert) / over-speed rate (pred > expert + 2 m/s)")
 print(f"   expert label mean: all {LS.mean():.2f}, lead-vehicle frames (n={int(lead_all.sum())}) {LS[lead_all].mean():.2f}, occ frames (n={int(occ_all.sum())}) {LS[occ_all].mean():.2f}")
 for c in conds:
-  P = np.array(spd[c]); row = []
+  P = np.array(spd_rec[c]); row = []
   for nm, sel in (("all", np.ones_like(lead_all)), ("lead", lead_all), ("occ", occ_all)):
     d = P[sel] - LS[sel]; row.append(f"{nm} {P[sel].mean():5.2f} / {d.mean():+5.2f} / {100*np.mean(d > 2.0):4.1f}%")
     res[c][f"spd_{nm}"] = float(P[sel].mean()); res[c][f"dspd_{nm}"] = float(d.mean()); res[c][f"over_{nm}"] = float(np.mean(d > 2.0))
