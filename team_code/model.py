@@ -356,6 +356,17 @@ class LidarCenterNet(nn.Module):
                 zero_last_y=bool(self.config.bridgedrive_zero_last_y), swap_xy=bool(getattr(self.config, 'bridgedrive_bev_swap_xy', 0)),
                 num_anchors=int(getattr(self.config, 'bridgedrive_num_anchors', 60)))
             assert self.config.bridgedrive_d_model == self.config.gru_input_size, 'ego queries must have the head width'
+          elif getattr(self.config, 'use_v2xstate_head', 0):
+            # original V2XState planner on bev_feature_grid; the GRU is not built (the 11th query still feeds the speed head)
+            from v2xstate_head import V2XStateHead   # pylint: disable=import-outside-toplevel
+            assert self.config.detect_boxes and self.config.use_bev_semantic, 'the V2XState head builds its occupancy from the detection and BEV-semantic heads'
+            hw = (self.config.lidar_resolution_height // self.config.bev_down_sample_factor,
+                  self.config.lidar_resolution_width // self.config.bev_down_sample_factor)
+            self.v2xstate_head = V2XStateHead(
+                feature_dim=self.config.bev_features_chanels, height=hw[0], width=hw[1], min_x=self.config.min_x,
+                max_x=self.config.max_x, min_y=self.config.min_y, max_y=self.config.max_y, num_basis=self.config.v2xstate_num_basis,
+                basis_temperature=self.config.v2xstate_temperature, traj_points=self.config.predict_checkpoint_len,
+                basis_source=self.config.v2xstate_basis_source)
           else:
             self.checkpoint_decoder = GRUWaypointsPredictorInterFuser(input_dim=self.config.gru_input_size,
                                                                       hidden_size=self.config.gru_hidden_size,
@@ -504,6 +515,8 @@ class LidarCenterNet(nn.Module):
     self._aux_logit = None   # hidden-hazard auxiliary prediction (scheme C), read by compute_loss
     self._aux_reg = None     # nearest connected hidden hazard state regression (scheme C+)
     self._ts_sensor = None   # sensor-only target speed from the null-token decoder pass (scheme D), read by compute_loss
+    self._v2xs = None        # V2XState head outputs (gate, attention, basis, aux losses), read by compute_loss / the agent
+    pred_bounding_box_early = pred_bev_semantic_early = None
     if self.config.two_tp_input:
       target_point = torch.cat((target_point, target_point_next), axis=1)
 
@@ -603,6 +616,18 @@ class LidarCenterNet(nn.Module):
             # train mode: dict(poses_cls_list, best_reg) from one noisy bridge sample; eval mode: (bs, 10, 2) sampled trajectory
             assert not self.config.input_path_to_target_speed_network, 'input_path_to_target_speed_network is not supported with the BridgeDrive head'
             pred_checkpoint = self.bridgedrive_head(gru_features, bev_map, gt_checkpoints=checkpoint_label)
+          elif getattr(self.config, 'use_v2xstate_head', 0):
+            assert not self.config.input_path_to_target_speed_network, 'input_path_to_target_speed_network is not supported with the V2XState head'
+            from v2xstate_head import tfpp_occupancy_inputs   # pylint: disable=import-outside-toplevel
+            # the detection and BEV-semantic heads run here (their outputs feed the occupancy channels) and are reused below
+            pred_bounding_box_early = self.head(bev_feature_grid)
+            pred_bev_semantic_early = self.bev_semantic_decoder(bev_feature_grid) * self.valid_bev_pixels
+            hd = self.v2xstate_head
+            objects, drivable = tfpp_occupancy_inputs(pred_bounding_box_early, pred_bev_semantic_early, self.valid_bev_pixels,
+                                                      (hd.height, hd.width))
+            self._v2xs = hd(bev_feature_grid, hd.occupancy(objects, drivable, target_point), target_point,
+                            hd.state(ego_vel, command))
+            pred_checkpoint = self._v2xs['checkpoints']
           else:
             pred_checkpoint = self.checkpoint_decoder(gru_features, target_point)
           if self.config.input_path_to_target_speed_network:
@@ -652,13 +677,17 @@ class LidarCenterNet(nn.Module):
       pred_depth = torch.sigmoid(pred_depth).squeeze(1)
 
     pred_bev_semantic = None
-    if self.config.use_bev_semantic:
+    if pred_bev_semantic_early is not None:   # V2XState head: already computed (same module, same input)
+      pred_bev_semantic = pred_bev_semantic_early
+    elif self.config.use_bev_semantic:
       pred_bev_semantic = self.bev_semantic_decoder(bev_feature_grid)
       # Mask invisible pixels. They will be ignored in the loss
       pred_bev_semantic = pred_bev_semantic * self.valid_bev_pixels
 
     pred_bounding_box = None
-    if self.config.detect_boxes:
+    if pred_bounding_box_early is not None:
+      pred_bounding_box = pred_bounding_box_early
+    elif self.config.detect_boxes:
       pred_bounding_box = self.head(bev_feature_grid)
 
     return pred_wp, pred_target_speed, pred_checkpoint, pred_semantic, pred_bev_semantic, pred_depth, \
@@ -703,6 +732,8 @@ class LidarCenterNet(nn.Module):
         loss_wp = torch.mean(torch.abs(pred_checkpoint - checkpoint_label))
       loss.update({'loss_target_speed': loss_target_speed})
       loss.update({'loss_checkpoint': loss_wp})
+      if getattr(self, '_v2xs', None) is not None and 'loss_mask' in self._v2xs:   # V2XState head, train mode only
+        loss.update({'loss_v2xs_mask': self._v2xs['loss_mask'], 'loss_v2xs_gate': self._v2xs['loss_gate']})
     if aux_label is not None and getattr(self, '_aux_logit', None) is not None:
       bce = F.binary_cross_entropy_with_logits(self._aux_logit, aux_label, reduction='none')
       m = aux_mask if aux_mask is not None else torch.ones_like(aux_label)

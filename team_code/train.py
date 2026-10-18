@@ -141,6 +141,11 @@ def main():
   parser.add_argument('--bridgedrive_anchor_path', type=str, default=config.bridgedrive_anchor_path)
   parser.add_argument('--bridgedrive_stats_path', type=str, default=config.bridgedrive_stats_path)
   parser.add_argument('--bridgedrive_step_num', type=int, default=config.bridgedrive_step_num)
+  parser.add_argument('--use_v2xstate_head', type=int, default=config.use_v2xstate_head,
+                      help='Original V2XState planner (spatial basis attention) as the checkpoint head instead of the GRU (post-train from a base checkpoint).')
+  parser.add_argument('--v2xstate_basis_source', type=str, default=config.v2xstate_basis_source, choices=['state', 'feature', 'concat'])
+  parser.add_argument('--v2xstate_mask_weight', type=float, default=config.v2xstate_mask_weight)
+  parser.add_argument('--v2xstate_gate_weight', type=float, default=config.v2xstate_gate_weight)
   parser.add_argument('--use_v2x_bev', type=int, default=config.use_v2x_bev,
                       help='Late fusion: rasterise the received vehicle states into extra lidar-BEV channels (input level, no decoder tokens).')
   parser.add_argument('--use_v2x_adapter', type=int, default=config.use_v2x_adapter,
@@ -533,6 +538,9 @@ def main():
     config.detailed_loss_weights['loss_ddbm_reg'] = 1.0
     config.detailed_loss_weights['loss_ddbm_cls'] = 1.0
     config.detailed_loss_weights['loss_checkpoint'] = 0.0
+  if getattr(config, 'use_v2xstate_head', 0):   # original V2XState aux losses, relative to loss_checkpoint 1.0 (normalised with the rest)
+    config.detailed_loss_weights['loss_v2xs_mask'] = float(config.v2xstate_mask_weight)
+    config.detailed_loss_weights['loss_v2xs_gate'] = float(config.v2xstate_gate_weight)
 
   if args.learn_multi_task_weights:
     for k in config.detailed_loss_weights:
@@ -625,6 +633,8 @@ def main():
     model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
   find_unused_parameters = False
   if config.use_plant or config.use_bridgedrive:   # BridgeDrive: layer-0 regression branch and the reg-stack cls branches get no gradient (as in the reference)
+    find_unused_parameters = True
+  if getattr(config, 'use_v2xstate_head', 0) and config.v2xstate_basis_source == 'feature':   # state_to_feature unused
     find_unused_parameters = True
   model = torch.nn.parallel.DistributedDataParallel(model,
                                                     device_ids=None,

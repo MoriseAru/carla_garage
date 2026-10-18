@@ -490,6 +490,8 @@ class GlobalConfig:
         'loss_checkpoint': 1.0,
         'loss_ddbm_reg': 0.0,   # BridgeDrive head (use_bridgedrive): set to 1.0 by train.py, loss_checkpoint -> 0
         'loss_ddbm_cls': 0.0,
+        'loss_v2xs_mask': 0.0,   # V2XState head (use_v2xstate_head): set by train.py from v2xstate_mask_weight / _gate_weight
+        'loss_v2xs_gate': 0.0,
         'loss_semantic': 1.0,
         'loss_bev_semantic': 1.0,
         'loss_depth': 1.0,
@@ -864,6 +866,15 @@ class GlobalConfig:
     self.bridgedrive_zero_last_y = 1       # reference inference quirk: y of the last checkpoint forced to 0 at every ODE step
     self.bridgedrive_num_anchors = 60      # K; only used to size the placeholder when the anchor file is absent (checkpoint restores it)
     self.bridgedrive_bev_swap_xy = 0       # grid_sample layout: 0 = this fork's BEV (col = x forward, row = y right); 1 = reference (LEAD) layout
+    # Original V2XState planner (VTC2026; intent-aware spatial basis attention) as the checkpoint head, replacing the GRU;
+    # team_code/v2xstate_head.py. Reads bev_feature_grid + occupancy built from TF++'s own detection / BEV-semantic
+    # outputs; target speed stays on the TF++ head. Recipe as BridgeDrive: post-train the base checkpoint.
+    self.use_v2xstate_head = 0
+    self.v2xstate_basis_source = 'concat'  # 'state' (the _4 config as trained) | 'feature' (original design) | 'concat' (user 2026-10-18)
+    self.v2xstate_num_basis = 4
+    self.v2xstate_temperature = 0.5
+    self.v2xstate_mask_weight = 0.02       # relative to loss_checkpoint 1.0, as in the original (attention_mask_weight)
+    self.v2xstate_gate_weight = 0.05       # gate_prior_weight
     self.v2x_bev_channels = 3      # occupancy, vx/10, vy/10
     self.v2x_bev_width = 2.0       # assumed vehicle width (m); the message carries the length only
     self.use_v2x_adapter = 0
