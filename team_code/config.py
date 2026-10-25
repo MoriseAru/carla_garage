@@ -571,6 +571,11 @@ class GlobalConfig:
     self.lateral_default_lookahead = 24
     self.lateral_speed_threshold = 23.150102938235136
     self.lateral_n = 6
+    # Floor on the lateral controller's checkpoint index (0 = TF++ as released). The speed rule above aims at checkpoint 1
+    # (3.5 m) at 8-10 m/s; the V2XState head's path is straight there at lane-change onsets (its labels are) and bends from
+    # checkpoint 2-3 on (MIYABI 10/25). A floor of N only acts below the speed where the rule reaches N (2: ~10.8 m/s,
+    # 3: ~14 m/s). Agent override: env LAT_MIN_LOOKAHEAD. User decision 2026-10-26 (fix B).
+    self.lateral_min_lookahead = 0
 
     # Parameters for longitudinal controller
     self.longitudinal_params = (1.1990342347353184, -0.8057602384167799, 1.710818710950062, 0.921890257450335,

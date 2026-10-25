@@ -62,6 +62,7 @@ class LateralPIDController(object):
     self.default_lookahead = config.lateral_default_lookahead
     self.speed_threshold = config.lateral_speed_threshold
     self.n = config.lateral_n
+    self.min_lookahead = int(getattr(config, 'lateral_min_lookahead', 0))   # 0 = released behaviour
 
     self._saved_window = []
     self._window = []
@@ -74,6 +75,7 @@ class LateralPIDController(object):
     n_lookahead = int(min(n_lookahead, route_np.shape[0] -
                           1))  # range [0, 8] - but 0 and 1 are never used because n_lookahead is overwritten below
 
+    n_lookahead = max(n_lookahead, self.min_lookahead)   # floor (lateral_min_lookahead); no-op at the default 0
     n_lookahead = min(n_lookahead, len(route_np) - 1)
     desired_heading_vec = route_np[n_lookahead] - ego_vehicle_location
 

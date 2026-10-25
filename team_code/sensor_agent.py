@@ -161,6 +161,11 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
         if getattr(self.config, 'use_bridgedrive', 0):
           print(f"BridgeDrive head: anchors {tuple(net.bridgedrive_head.plan_anchor.shape)}, steps {net.bridgedrive_head.step_num}, "
                 f"zero_last_y {net.bridgedrive_head.zero_last_y}, swap_xy {net.bridgedrive_head.diff_decoder[0].cross_bev_attention.swap_xy}", flush=True)
+        if os.environ.get('LAT_MIN_LOOKAHEAD', '') != '':
+          # fix B (user 2026-10-26): floor on the lateral controller's checkpoint index; same value for every model it is used with
+          net.lateral_pid_controller.min_lookahead = int(os.environ['LAT_MIN_LOOKAHEAD'])
+        print(f"Lateral controller: min lookahead index {net.lateral_pid_controller.min_lookahead} "
+              f"({'LAT_MIN_LOOKAHEAD' if os.environ.get('LAT_MIN_LOOKAHEAD', '') != '' else 'config default'}; 0 = TF++ as released)", flush=True)
         self.nets.append(net)
 
     # Availability router (V2X_ROUTE_THRESH > 0): a second, V2X-free model that takes over on frames where too few of
