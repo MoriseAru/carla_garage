@@ -238,7 +238,16 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     # windows in the training data last 5-6 s (median). Depends only on the route and the ego's odometry, not the model.
     self.cl_min_hold_m = float(os.environ.get('CL_MIN_HOLD_M', 0))
     self.cl_hold_cmd, self.cl_hold_travel, self.cl_hold_prev_pos = None, 0.0, None
-    print(f"Lane-change command hold: {'ON, ' + str(self.cl_min_hold_m) + ' m' if self.cl_min_hold_m > 0 else 'off'}",
+    self.cl_hold_overriding = False
+    # CL_TP_LOOKAHEAD_M=<m> (default 0 = off; needs CL_MIN_HOLD_M): while the hold above is overriding (the raw lane-change
+    # window ended before CL_MIN_HOLD_M), a sparse target point farther than this is replaced by the point this many metres
+    # ahead along the leaderboard's dense route (given to every agent by set_global_plan). Reason: on those routes the
+    # lane-change points and a junction entry sit within ~4 m, so the near target point in the new lane lasts 0.65 s and
+    # then jumps to ~55 m, a distance the models barely react to.
+    self.cl_tp_lookahead_m = float(os.environ.get('CL_TP_LOOKAHEAD_M', 0))
+    assert self.cl_tp_lookahead_m <= 0 or self.cl_min_hold_m > 0, 'CL_TP_LOOKAHEAD_M needs CL_MIN_HOLD_M'
+    print(f"Lane-change command hold: {'ON, ' + str(self.cl_min_hold_m) + ' m' if self.cl_min_hold_m > 0 else 'off'}; "
+          f"target-point lookahead: {'ON, ' + str(self.cl_tp_lookahead_m) + ' m' if self.cl_tp_lookahead_m > 0 else 'off'}",
           flush=True)
 
     # Filtering
@@ -349,6 +358,10 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self._route_planner = RoutePlanner(self.config.route_planner_min_distance, self.config.route_planner_max_distance,
                                        self.lat_ref, self.lon_ref)
     self._route_planner.set_route(self._global_plan, True)
+    if self.cl_tp_lookahead_m > 0:
+      self.cl_dense = np.array([self._route_planner.convert_gps_to_carla(np.array([p['lat'], p['lon'], p['z']]))[:2]
+                                for p, _ in self._plan_gps_HACK])
+      self.cl_dense_idx = 0
     self.initialized = True
 
   def v2x_states(self, lidar=None):
@@ -615,6 +628,9 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     command = self.commands[-2]
     if self.cl_min_hold_m > 0:
       command = self.hold_lane_change_command(command, result['gps'])
+    if self.cl_tp_lookahead_m > 0 and self.cl_hold_overriding and \
+        np.linalg.norm(np.asarray(target_point[:2]) - result['gps']) > self.cl_tp_lookahead_m:
+      target_point = self.dense_route_lookahead(result['gps'])
     one_hot_command = t_u.command_to_one_hot(command)
     result['command'] = torch.from_numpy(one_hot_command[np.newaxis]).to(self.device, dtype=torch.float32)
 
@@ -647,14 +663,29 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if self.cl_hold_prev_pos is not None:
       self.cl_hold_travel += float(np.linalg.norm(pos - self.cl_hold_prev_pos))
     self.cl_hold_prev_pos = pos
+    self.cl_hold_overriding = False
     if command in (5, 6):
       if command != self.cl_hold_cmd:
         self.cl_hold_cmd, self.cl_hold_travel = command, 0.0
       return command
     if self.cl_hold_cmd is not None and command in (3, 4) and self.cl_hold_travel < self.cl_min_hold_m:
+      self.cl_hold_overriding = True
       return self.cl_hold_cmd
     self.cl_hold_cmd = None
     return command
+
+  def dense_route_lookahead(self, gps):
+    """CL_TP_LOOKAHEAD_M (see setup): the dense-route point CL_TP_LOOKAHEAD_M metres along the route ahead of the ego's
+    nearest dense point (searched forward from the last one, so progress is monotonic). Returns CARLA (x, y, 0)."""
+    d, i0 = self.cl_dense, self.cl_dense_idx
+    seg = d[i0:i0 + 100] if i0 > 0 else d   # first call: whole route (the hold can start anywhere)
+    i = i0 + int(np.argmin(np.linalg.norm(seg - np.asarray(gps[:2]), axis=1)))
+    self.cl_dense_idx = i
+    acc = 0.0
+    while i + 1 < len(d) and acc < self.cl_tp_lookahead_m:
+      acc += float(np.linalg.norm(d[i + 1] - d[i]))
+      i += 1
+    return np.array([d[i][0], d[i][1], 0.0])
 
   def _v2xs_dump_step(self, net, tick_data, lidar_bev, velocity, coop_states, coop_mask, pred_checkpoint):
     """V2XS_DUMP=<dir>: per-step record of the V2XState head's inputs / gate for LOCAL's closed-loop consistency check
