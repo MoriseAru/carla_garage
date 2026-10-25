@@ -231,6 +231,15 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     self.commands.append(4)
     self.commands.append(4)
     self.target_point_prev = [1e5, 1e5, 1e5]
+    # CL_MIN_HOLD_M=<m> (default 0 = off): keep a lane-change command (CHANGELANELEFT / RIGHT) for at least this many metres
+    # of ego travel after it first appears, overriding LANEFOLLOW / STRAIGHT; a turn or the opposite lane change ends it.
+    # Reason: the sparse plan marks a lane change with two points ~1-4 m apart, and the window ends at the next sparse
+    # point; when a junction entry follows right after, the model sees the command for only ~6 m (0.65 s), while lane-change
+    # windows in the training data last 5-6 s (median). Depends only on the route and the ego's odometry, not the model.
+    self.cl_min_hold_m = float(os.environ.get('CL_MIN_HOLD_M', 0))
+    self.cl_hold_cmd, self.cl_hold_travel, self.cl_hold_prev_pos = None, 0.0, None
+    print(f"Lane-change command hold: {'ON, ' + str(self.cl_min_hold_m) + ' m' if self.cl_min_hold_m > 0 else 'off'}",
+          flush=True)
 
     # Filtering
     self.ego_model = EgoModel(dt=self.config.carla_frame_rate)
@@ -603,7 +612,10 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       self.target_point_prev = target_point
       self.commands.append(far_command.value)
 
-    one_hot_command = t_u.command_to_one_hot(self.commands[-2])
+    command = self.commands[-2]
+    if self.cl_min_hold_m > 0:
+      command = self.hold_lane_change_command(command, result['gps'])
+    one_hot_command = t_u.command_to_one_hot(command)
     result['command'] = torch.from_numpy(one_hot_command[np.newaxis]).to(self.device, dtype=torch.float32)
 
     ego_target_point = t_u.inverse_conversion_2d(target_point[:2], result['gps'], result['compass'])  # original
@@ -627,6 +639,22 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       self.lon_logger.log_step(route)
 
     return result
+
+  def hold_lane_change_command(self, command, gps):
+    """CL_MIN_HOLD_M (see setup). command: RoadOption value (5 / 6 = lane change left / right, 3 = STRAIGHT,
+    4 = LANEFOLLOW); gps: filtered ego position (CARLA x, y)."""
+    pos = np.asarray(gps[:2], dtype=np.float64)
+    if self.cl_hold_prev_pos is not None:
+      self.cl_hold_travel += float(np.linalg.norm(pos - self.cl_hold_prev_pos))
+    self.cl_hold_prev_pos = pos
+    if command in (5, 6):
+      if command != self.cl_hold_cmd:
+        self.cl_hold_cmd, self.cl_hold_travel = command, 0.0
+      return command
+    if self.cl_hold_cmd is not None and command in (3, 4) and self.cl_hold_travel < self.cl_min_hold_m:
+      return self.cl_hold_cmd
+    self.cl_hold_cmd = None
+    return command
 
   def _v2xs_dump_step(self, net, tick_data, lidar_bev, velocity, coop_states, coop_mask, pred_checkpoint):
     """V2XS_DUMP=<dir>: per-step record of the V2XState head's inputs / gate for LOCAL's closed-loop consistency check
