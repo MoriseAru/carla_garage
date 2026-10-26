@@ -251,6 +251,15 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     # then jumps to ~55 m, a distance the models barely react to.
     self.cl_tp_lookahead_m = float(os.environ.get('CL_TP_LOOKAHEAD_M', 0))
     assert self.cl_tp_lookahead_m <= 0 or self.cl_min_hold_m > 0, 'CL_TP_LOOKAHEAD_M needs CL_MIN_HOLD_M'
+    # LAT_CL_FLOOR=<idx> (default off; user 2026-10-26, after the global fix B lost on junction turns): the lateral
+    # controller's checkpoint-index floor applies only within LAT_CL_FLOOR_M metres (default 20) of ego travel after a
+    # lane-change command (CHANGELANELEFT / RIGHT) appears; elsewhere the floor is LAT_MIN_LOOKAHEAD / config (0 = released).
+    # The command fed to the model is not changed. Depends only on the route and the ego's odometry, not the model.
+    self.lat_cl_floor = int(os.environ.get('LAT_CL_FLOOR', 0))
+    self.lat_cl_floor_m = float(os.environ.get('LAT_CL_FLOOR_M', 20))
+    self.lat_cl_travel, self.lat_cl_prev_pos = None, None   # None = no lane-change window open
+    self.lat_floor_default = [n.lateral_pid_controller.min_lookahead for n in self.nets]
+    print(f"Lane-change-only lateral floor: {f'ON, index {self.lat_cl_floor} for {self.lat_cl_floor_m} m' if self.lat_cl_floor > 0 else 'off'}", flush=True)
     print(f"Lane-change command hold: {'ON, ' + str(self.cl_min_hold_m) + ' m' if self.cl_min_hold_m > 0 else 'off'}; "
           f"target-point lookahead: {'ON, ' + str(self.cl_tp_lookahead_m) + ' m' if self.cl_tp_lookahead_m > 0 else 'off'}",
           flush=True)
@@ -636,6 +645,8 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
     if self.cl_tp_lookahead_m > 0 and self.cl_hold_overriding and \
         np.linalg.norm(np.asarray(target_point[:2]) - result['gps']) > self.cl_tp_lookahead_m:
       target_point = self.dense_route_lookahead(result['gps'])
+    if self.lat_cl_floor > 0:
+      self.lane_change_floor(self.commands[-2], result['gps'])
     one_hot_command = t_u.command_to_one_hot(command)
     result['command'] = torch.from_numpy(one_hot_command[np.newaxis]).to(self.device, dtype=torch.float32)
 
@@ -660,6 +671,24 @@ class SensorAgent(autonomous_agent.AutonomousAgent):
       self.lon_logger.log_step(route)
 
     return result
+
+  def lane_change_floor(self, raw_command, gps):
+    """LAT_CL_FLOOR (see setup). raw_command: the agent's command before any hold; gps: filtered ego position."""
+    pos = np.asarray(gps[:2], dtype=np.float64)
+    if self.lat_cl_travel is not None and self.lat_cl_prev_pos is not None:
+      self.lat_cl_travel += float(np.linalg.norm(pos - self.lat_cl_prev_pos))
+      if self.lat_cl_travel >= self.lat_cl_floor_m and raw_command not in (5, 6):
+        self.lat_cl_travel = None
+    if raw_command in (5, 6) and self.lat_cl_travel is None and getattr(self, 'lat_cl_raw_prev', None) not in (5, 6):
+      self.lat_cl_travel = 0.0   # window opens at the onset of a lane-change command
+    self.lat_cl_raw_prev = raw_command
+    self.lat_cl_prev_pos = pos
+    active = self.lat_cl_travel is not None
+    for net, base in zip(self.nets, self.lat_floor_default):
+      net.lateral_pid_controller.min_lookahead = max(base, self.lat_cl_floor) if active else base
+    if active != getattr(self, 'lat_cl_active_prev', False):
+      print(f"LAT_CL_FLOOR {'on' if active else 'off'} step {self.step}", flush=True)
+      self.lat_cl_active_prev = active
 
   def hold_lane_change_command(self, command, gps):
     """CL_MIN_HOLD_M (see setup). command: RoadOption value (5 / 6 = lane change left / right, 3 = STRAIGHT,
