@@ -846,6 +846,10 @@ class GlobalConfig:
     # closed-loop gain) while the sensor-only head keeps base behaviour. Training runs a second decoder pass with all tokens
     # nulled so the sensor head sees every frame ('loss_target_speed_sensor').
     self.v2x_dual_head = 0
+    # Training-mode study (2026-11-06, frozen / post-hoc / scratch): all three keep the decoder-memory token injection.
+    self.v2x_freeze_base = 0       # 1: only the token encoder (coop_*) is trained; every other module is frozen and kept in eval mode
+    self.v2x_shuffle_train = 0     # 1: training tokens are rolled by one sample within the batch (tokens of another frame; content control)
+    self.v2x_plugin_lr_mult = 1.0  # lr multiplier of the token encoder (coop_*) parameter group
     # scheme D3 (with the dual head): visibility-aware token dropout for the cooperative head -- hidden vehicles always
     # keep their token, visible ones are kept with prob v2x_vis_keep (see v2x_features.apply_visibility_dropout)
     self.v2x_vis_dropout = 0

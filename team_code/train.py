@@ -148,6 +148,12 @@ def main():
   parser.add_argument('--v2xstate_gate_weight', type=float, default=config.v2xstate_gate_weight)
   parser.add_argument('--use_v2x_bev', type=int, default=config.use_v2x_bev,
                       help='Late fusion: rasterise the received vehicle states into extra lidar-BEV channels (input level, no decoder tokens).')
+  parser.add_argument('--v2x_freeze_base', type=int, default=config.v2x_freeze_base,
+                      help='Training-mode study: train only the token encoder (coop_*); everything else frozen and in eval mode.')
+  parser.add_argument('--v2x_shuffle_train', type=int, default=config.v2x_shuffle_train,
+                      help='Content control: training tokens rolled by one sample within the batch (another frame).')
+  parser.add_argument('--v2x_plugin_lr_mult', type=float, default=config.v2x_plugin_lr_mult,
+                      help='lr multiplier of the token encoder (coop_*) parameter group.')
   parser.add_argument('--use_v2x_adapter', type=int, default=config.use_v2x_adapter,
                       help='Scheme A: frozen-base residual adapter on the planning queries; only v2x_adapter.* is trained.')
   parser.add_argument('--v2x_adapter_layers', type=int, default=config.v2x_adapter_layers)
@@ -541,6 +547,14 @@ def main():
   if getattr(config, 'use_v2xstate_head', 0):   # original V2XState aux losses, relative to loss_checkpoint 1.0 (normalised with the rest)
     config.detailed_loss_weights['loss_v2xs_mask'] = float(config.v2xstate_mask_weight)
     config.detailed_loss_weights['loss_v2xs_gate'] = float(config.v2xstate_gate_weight)
+  # Auxiliary V2X losses only count when their head exists; otherwise their 1.0 entries would shrink every other weight
+  # through the normaliser below (fork 776a079, which trained tfpp_base_000 / tfpp_v2x_000, did not have these keys).
+  if not getattr(config, 'use_v2x_aux', 0):
+    config.detailed_loss_weights['loss_hidden_hazard'] = 0.0
+  if not getattr(config, 'use_v2x_aux_reg', 0):
+    config.detailed_loss_weights['loss_hidden_reg'] = 0.0
+  if not (config.use_v2x and getattr(config, 'v2x_dual_head', 0)):
+    config.detailed_loss_weights['loss_target_speed_sensor'] = 0.0
 
   if args.learn_multi_task_weights:
     for k in config.detailed_loss_weights:
@@ -608,11 +622,18 @@ def main():
       sd_load, padded = model.adapt_state_dict_for_bev_fusion(sd_load)
       if rank == 0:
         print('use_v2x_bev: zero-padded raster input channels in', padded)
-    model.load_state_dict(sd_load, strict=False)
+    load_res = model.load_state_dict(sd_load, strict=False)
+    if rank == 0:   # strict=False: show what did not load (a fresh plug-in on a base checkpoint: only coop_* missing)
+      print(f'load_state_dict: missing {len(load_res.missing_keys)} {load_res.missing_keys[:12]} | '
+            f'unexpected {len(load_res.unexpected_keys)} {load_res.unexpected_keys[:12]}', flush=True)
 
   if getattr(config, 'use_v2x_adapter', 0):   # scheme A: everything but the adapter is the frozen base model
     for n_, p_ in model.named_parameters():
       p_.requires_grad_(n_.startswith('v2x_adapter.'))
+  if getattr(config, 'v2x_freeze_base', 0):   # training-mode study, frozen tier: only the token encoder learns
+    assert config.use_v2x and not getattr(config, 'use_v2x_adapter', 0) and args.load_file, 'v2x_freeze_base needs use_v2x and a base checkpoint'
+    for n_, p_ in model.named_parameters():
+      p_.requires_grad_(n_.startswith('coop_'))
   if config.freeze_backbone:
     model.backbone.requires_grad_(False)
 
@@ -646,6 +667,12 @@ def main():
     params = model.module.create_optimizer_groups(config.weight_decay)
   else:
     params = model.parameters()
+  if float(getattr(config, 'v2x_plugin_lr_mult', 1.0)) != 1.0:   # token encoder in its own group (the scheduler scales both)
+    assert not config.use_optim_groups   # ZeroRedundancyOptimizer takes param-group dicts as well
+    named = list(model.module.named_parameters())
+    params = [{'params': [p_ for n_, p_ in named if not n_.startswith('coop_')]},
+              {'params': [p_ for n_, p_ in named if n_.startswith('coop_')], 'lr': args.lr * float(config.v2x_plugin_lr_mult)}]
+    assert len(params[1]['params']) > 0, 'v2x_plugin_lr_mult: no coop_* parameters'
 
   if args.compile:
     model = torch.compile(model, mode=args.compile_mode)
@@ -1107,6 +1134,10 @@ class Engine(object):
 
   def train(self):
     self.model.train()
+    if getattr(self.config, 'v2x_freeze_base', 0):   # frozen tier: BN statistics and dropout of the base stay as trained
+      for n_, m_ in self.model.module.named_modules():   # RNNs stay in train mode: cudnn has no eval-mode backward (single-layer
+        if n_ and not n_.startswith('coop_') and not isinstance(m_, torch.nn.RNNBase):   # GRU, no dropout -> same output)
+          m_.training = False
 
     num_batches = 0
     loss_epoch = 0.0

@@ -506,6 +506,8 @@ class LidarCenterNet(nn.Module):
     null = self.coop_null.expand(bs, k, -1)
     if coop_states is None:
       return null
+    if self.training and getattr(self.config, 'v2x_shuffle_train', 0) and bs > 1:   # content control: another sample's tokens
+      coop_states, coop_mask = torch.roll(coop_states, 1, dims=0), torch.roll(coop_mask, 1, dims=0)
     tok = self.coop_proj(coop_states) + self.coop_slot_embedding.weight[None, :k]
     return torch.where(coop_mask[..., None] > 0.5, tok, null)
 
