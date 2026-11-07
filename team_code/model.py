@@ -149,6 +149,44 @@ class V2XResidualAdapter(nn.Module):
     self.last_attn = attn if need_weights else None
     return queries + delta
 
+# Training-mode study, follow-up (2026-11-07, OmniV2X discussion; HANDOVER 6647).
+# Planning-decoder modules re-initialised by tfm_reinit_planner (perturbed start): everything that turns the backbone's
+# fused BEV map + speed/command into checkpoints and target speed. Perception (backbone + aux heads) keeps the base.
+PLANNER_PREFIXES = ('change_channel.', 'extra_sensor_encoder.', 'extra_sensor_pos_embed', 'join.', 'checkpoint_query',
+                    'checkpoint_decoder.', 'target_speed_network.')
+
+
+def reset_planner(model, fresh_sd):
+  """Copy the freshly initialised planning-decoder tensors (fresh_sd = state_dict of an untouched model) into model.
+  Returns the names reset."""
+  sd = model.state_dict()
+  names = [k for k in sd if k.startswith(PLANNER_PREFIXES)]
+  assert names, 'reset_planner: no planning-decoder tensors found'
+  model.load_state_dict({k: fresh_sd[k] for k in names}, strict=False)
+  return names
+
+
+def mem_drop_mask(bs, grid_hw, n_mem, p, lo, hi, device):
+  """memory_key_padding_mask (True = hidden) for the planning decoder: per sample, with probability p, one contiguous
+  rectangle of the BEV token grid covering a fraction ~U(lo, hi) of it is hidden. The memory is
+  [H*W BEV tokens (row-major), speed/command token, coop tokens...]; only BEV tokens are ever hidden."""
+  h, w = grid_hw
+  m = torch.zeros(bs, n_mem, dtype=torch.bool)
+  for b in range(bs):
+    if torch.rand(()) >= p:
+      continue
+    a = float(lo + (hi - lo) * torch.rand(()))
+    ratio = float(torch.exp((torch.rand(()) * 2 - 1) * 0.6931))   # aspect in [1/2, 2]
+    bh = int(min(h, max(1, round((a * h * w * ratio) ** 0.5))))
+    bw = int(min(w, max(1, round(a * h * w / bh))))
+    r0 = int(torch.randint(0, h - bh + 1, ()))
+    c0 = int(torch.randint(0, w - bw + 1, ()))
+    g = torch.zeros(h, w, dtype=torch.bool)
+    g[r0:r0 + bh, c0:c0 + bw] = True
+    m[b, :h * w] = g.flatten()
+  return m.to(device)
+
+
 class LidarCenterNet(nn.Module):
   """
   The main model class. It can run all model configurations.
@@ -544,6 +582,7 @@ class LidarCenterNet(nn.Module):
       if self.config.transformer_decoder_join:
         fused_features = self.change_channel(fused_features)
         fused_features = fused_features + self.encoder_pos_encoding(fused_features)
+        grid_hw = tuple(fused_features.shape[-2:])   # BEV token grid (rows, cols) of the decoder memory
         fused_features = torch.flatten(fused_features, start_dim=2)
         if self.config.tp_attention:
           num_pixel_tokens = fused_features.shape[2]
@@ -604,7 +643,12 @@ class LidarCenterNet(nn.Module):
             if self.v2x_adapter_on:   # scheme A: residual read of the coop tokens; identity when no token is valid
               joined_checkpoint_features = self.v2x_join(self.checkpoint_query.repeat(bs, 1, 1), fused_features, coop_states, coop_mask)
             else:
-              joined_checkpoint_features = self.join(self.checkpoint_query.repeat(bs, 1, 1), fused_features)
+              mem_kpm = None
+              if self.training and float(getattr(self.config, 'tfm_mem_drop_p', 0.0)) > 0:   # training only: hide a BEV block
+                mem_kpm = mem_drop_mask(bs, grid_hw, fused_features.shape[1], self.config.tfm_mem_drop_p,
+                                        self.config.tfm_mem_drop_lo, self.config.tfm_mem_drop_hi, fused_features.device)
+              joined_checkpoint_features = self.join(self.checkpoint_query.repeat(bs, 1, 1), fused_features,
+                                                     memory_key_padding_mask=mem_kpm)
 
           gru_features = joined_checkpoint_features[:, :self.config.predict_checkpoint_len]
           target_speed_features = joined_checkpoint_features[:, self.config.predict_checkpoint_len]

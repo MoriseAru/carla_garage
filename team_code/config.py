@@ -850,6 +850,11 @@ class GlobalConfig:
     self.v2x_freeze_base = 0       # 1: only the token encoder (coop_*) is trained; every other module is frozen and kept in eval mode
     self.v2x_shuffle_train = 0     # 1: training tokens are rolled by one sample within the batch (tokens of another frame; content control)
     self.v2x_plugin_lr_mult = 1.0  # lr multiplier of the token encoder (coop_*) parameter group
+    # Follow-up (2026-11-07, HANDOVER 6647): perturbed start / modality dropout on the post-hoc tier (both also run with use_v2x 0)
+    self.tfm_reinit_planner = 0    # 1: after loading the base, the planning decoder (model.PLANNER_PREFIXES) is re-initialised
+    self.tfm_mem_drop_p = 0.0      # training only: probability that a sample's planning-decoder memory loses one BEV block
+    self.tfm_mem_drop_lo = 0.25    # hidden block area, fraction of the BEV token grid: ~U(lo, hi)
+    self.tfm_mem_drop_hi = 0.75
     # scheme D3 (with the dual head): visibility-aware token dropout for the cooperative head -- hidden vehicles always
     # keep their token, visible ones are kept with prob v2x_vis_keep (see v2x_features.apply_visibility_dropout)
     self.v2x_vis_dropout = 0

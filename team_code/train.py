@@ -154,6 +154,12 @@ def main():
                       help='Content control: training tokens rolled by one sample within the batch (another frame).')
   parser.add_argument('--v2x_plugin_lr_mult', type=float, default=config.v2x_plugin_lr_mult,
                       help='lr multiplier of the token encoder (coop_*) parameter group.')
+  parser.add_argument('--tfm_reinit_planner', type=int, default=config.tfm_reinit_planner,
+                      help='Perturbed start: re-initialise the planning decoder after loading the base (not on resume).')
+  parser.add_argument('--tfm_mem_drop_p', type=float, default=config.tfm_mem_drop_p,
+                      help='Modality dropout (training only): probability of hiding one BEV block from the planning decoder.')
+  parser.add_argument('--tfm_mem_drop_lo', type=float, default=config.tfm_mem_drop_lo)
+  parser.add_argument('--tfm_mem_drop_hi', type=float, default=config.tfm_mem_drop_hi)
   parser.add_argument('--use_v2x_adapter', type=int, default=config.use_v2x_adapter,
                       help='Scheme A: frozen-base residual adapter on the planning queries; only v2x_adapter.* is trained.')
   parser.add_argument('--v2x_adapter_layers', type=int, default=config.v2x_adapter_layers)
@@ -610,6 +616,7 @@ def main():
   model.cuda(device=device)
 
   start_epoch = 0  # Epoch to continue training from
+  fresh_sd = {k: v.detach().clone() for k, v in model.state_dict().items()} if getattr(config, 'tfm_reinit_planner', 0) else None
   if not args.load_file is None:
     # Load checkpoint
     print('=============load=================')
@@ -627,6 +634,17 @@ def main():
       print(f'load_state_dict: missing {len(load_res.missing_keys)} {load_res.missing_keys[:12]} | '
             f'unexpected {len(load_res.unexpected_keys)} {load_res.unexpected_keys[:12]}', flush=True)
 
+  if getattr(config, 'tfm_reinit_planner', 0) and not args.continue_epoch:   # perturbed start; a resume keeps the trained decoder
+    assert args.load_file, 'tfm_reinit_planner needs a base checkpoint'
+    from model import reset_planner   # pylint: disable=import-outside-toplevel
+    reset = reset_planner(model, fresh_sd)
+    if rank == 0:
+      print(f'tfm_reinit_planner: reset {len(reset)} planning-decoder tensors to fresh init', flush=True)
+  if float(getattr(config, 'tfm_mem_drop_p', 0.0)) > 0:
+    assert config.transformer_decoder_join and config.use_controller_input_prediction and not config.tp_attention \
+        and not config.use_wp_gru and not getattr(config, 'v2x_dual_head', 0) and not getattr(config, 'use_v2x_adapter', 0), \
+        'tfm_mem_drop_p is implemented on the plain checkpoint-decoder path only'
+  del fresh_sd
   if getattr(config, 'use_v2x_adapter', 0):   # scheme A: everything but the adapter is the frozen base model
     for n_, p_ in model.named_parameters():
       p_.requires_grad_(n_.startswith('v2x_adapter.'))
