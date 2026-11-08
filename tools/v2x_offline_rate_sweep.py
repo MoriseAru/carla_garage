@@ -14,6 +14,9 @@ import config as cfgmod, model as modmod, data as datamod, v2x_features
 
 ap = argparse.ArgumentParser(); ap.add_argument("--root", required=True); ap.add_argument("--v2x", required=True); ap.add_argument("--base", required=True)
 ap.add_argument("--n", type=int, default=3000); ap.add_argument("--bs", type=int, default=16)
+ap.add_argument("--frames", default="", help="npy of dataset indices to evaluate (e.g. tools/v2x_occ_index.py output); --n caps it by a seeded subsample")
+ap.add_argument("--conds", default="", help="comma list of conditions (default: all); base, v2x_r1.0, v2x_r1.0_rnd, v2x_r0 are always kept")
+ap.add_argument("--out", default="/work/gn21/n21001/V2XState_Real/tmp/v2x_offline_rate_sweep.json")
 ap.add_argument("--no_aug", type=int, default=0, help="1: un-augmented frames (augment_percentage=0, no colour/lidar aug) - the distribution the adapter cache and closed loop use")
 a = ap.parse_args()
 dev = "cuda"
@@ -29,7 +32,11 @@ cfg_v, net_v = load(a.v2x); cfg_b, net_b = load(a.base)
 cfg_v.initialize(root_dir=[a.root], setting="all", use_v2x=1 if not getattr(cfg_v, "use_v2x_bev", 0) else 0, use_v2x_bev=getattr(cfg_v, "use_v2x_bev", 0))   # dataset with coop states (augmentation kept: identical batch for every condition)
 if a.no_aug: cfg_v.augment_percentage = 0.0; cfg_v.use_color_aug = 0; cfg_v.lidar_aug_prob = 0.0; print("augmentation OFF", flush=True)
 ds = datamod.CARLA_Data(root=cfg_v.data_roots, config=cfg_v, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
-g = torch.Generator().manual_seed(0); idx = torch.randperm(len(ds), generator=g)[: a.n].tolist()
+g = torch.Generator().manual_seed(0)
+if a.frames:
+    pool = np.load(a.frames).astype(np.int64); idx = pool[torch.randperm(len(pool), generator=g)[: a.n].numpy()].tolist(); print(f"frames from {a.frames}: {len(idx)} of {len(pool)}", flush=True)
+else:
+    idx = torch.randperm(len(ds), generator=g)[: a.n].tolist()
 sub = torch.utils.data.Subset(ds, idx); dl = torch.utils.data.DataLoader(sub, batch_size=a.bs, shuffle=False, num_workers=16)
 print(f"frames {len(sub)} of {len(ds)}; K={cfg_v.v2x_k}", flush=True)
 
@@ -39,6 +46,7 @@ print(f"frames {len(sub)} of {len(ds)}; K={cfg_v.v2x_k}", flush=True)
 # Training at rate 1 only ever showed nulls at the tail, so both are out of distribution -- differently.
 conds = ["base", "v2x_r1.0", "v2x_r1.0_rnd", "v2x_r0.75", "v2x_r0.75_c", "v2x_r0.5", "v2x_r0.5_c", "v2x_r0.25", "v2x_r0.25_c",
          "v2x_r0.1", "v2x_r0.1_c", "v2x_r0.05", "v2x_r0.05_c", "v2x_r0", "v2x_r0_drop"]
+if a.conds: conds = [c for c in conds if c in ("base", "v2x_r1.0", "v2x_r1.0_rnd", "v2x_r0") or c in a.conds.split(",")]
 # "v2x_r1.0_rnd" = every token present, each rotated about the ego by a random angle (offline V2X_RANDOMIZE=all): the content control.
 # Output-distance monitors (planning heads, every frame): r1 vs rnd (does content matter?), r0 vs base (is rate 0 the base?).
 dist = {k: [] for k in ("p_r1_rnd", "p_r0_base", "kl_r0_base", "ck_r1_rnd", "ck_r0_base")}
@@ -125,5 +133,5 @@ if aux_logits:
     aux_auc = float(roc_auc_score(aux_labels, aux_logits)) if 0 < sum(aux_labels) < len(aux_labels) else None
     print(f"aux hidden-hazard head at rate 1: AUC {aux_auc:.3f} (positives {100*np.mean(aux_labels):.1f}%)" if aux_auc else "aux head: degenerate labels")
 json.dump(dict(n=n, strata=strat, aux_auc=aux_auc, acc={c: acc[c]/n for c in conds}, ce={c: ce[c]/n for c in conds}, l1={c: l1[c]/n for c in conds}, fill_mean=float(fill.mean()), frac_any_null=any_null/n),
-          open("/work/gn21/n21001/V2XState_Real/tmp/v2x_offline_rate_sweep.json", "w"), indent=1)
+          open(a.out, "w"), indent=1)
 print("RATE_SWEEP_DONE")
