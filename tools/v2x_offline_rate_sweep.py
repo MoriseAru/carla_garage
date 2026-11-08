@@ -58,6 +58,10 @@ def compact_slots(states, mask):
     order = torch.argsort((mask < 0.5).to(torch.int64), dim=1, stable=True)
     return torch.gather(states, 1, order[..., None].expand_as(states)), torch.gather(mask, 1, order)
 acc = {c: 0 for c in conds}; ce = {c: 0.0 for c in conds}; l1 = {c: 0.0 for c in conds}; n = 0; fill = []; any_null = 0
+# controller-aligned outputs (team_code/sensor_agent.py:923-936, UNCERTAINTY_WEIGHT=1): brake if P(stop) > brake_uncertainty_threshold, else
+# speed = sum_k P_k * target_speeds[k]. Expert speed = twohot . target_speeds; expert stop = argmax class 0.
+CTRL_C = ("base", "v2x_r1.0", "v2x_r1.0_rnd", "v2x_r0"); spd_t = torch.tensor(cfg_v.target_speeds, dtype=torch.float32, device=dev)
+ctrl = {c: {"v": [], "brk": []} for c in CTRL_C}; v_exp = []
 correct = {c: [] for c in conds}; strata = {"occ": [], "occ_slow": [], "slow": [], "stop_label": []}; aux_logits, aux_labels = [], []
 orig_coop_tokens = net_v.coop_tokens
 def drop_tokens(states, mask, bs): return torch.zeros(bs, 0, cfg_v.gru_input_size, device=dev)
@@ -68,6 +72,7 @@ with torch.no_grad():
         tp = data["target_point"].to(dev, dtype=torch.float32); tpn = data["target_point_next"].to(dev, dtype=torch.float32) if cfg_v.two_tp_input else None
         vel = data["speed"].to(dev, dtype=torch.float32).unsqueeze(1); cmd = data["command"].to(dev, dtype=torch.float32)
         ts_label = data["target_speed_twohot"].to(dev, dtype=torch.float32).argmax(1)   # class index of the expert target speed
+        v_exp += (data["target_speed_twohot"].to(dev, dtype=torch.float32) @ spd_t).tolist()
         ckpt_label = data["route"][:, : cfg_v.predict_checkpoint_len].to(dev, dtype=torch.float32)
         if n == 0: print("label check: ts classes", int(ts_label.min()), "-", int(ts_label.max()), "of", len(cfg_v.target_speeds), "; ckpt", tuple(ckpt_label.shape), "; cmd", tuple(cmd.shape), flush=True)
         st = data["coop_states"].to(dev, dtype=torch.float32); mk = data["coop_mask"].to(dev, dtype=torch.float32); bk = data["coop_bucket"].to(dev)
@@ -98,6 +103,9 @@ with torch.no_grad():
             pred_ts, pred_ckpt = out[1], out[2]
             if c in ("base", "v2x_r1.0", "v2x_r1.0_rnd", "v2x_r0"): keep[c] = (pred_ts.float(), pred_ckpt.float())
             correct[c] += (pred_ts.argmax(1) == ts_label).tolist()
+            if c in CTRL_C:
+                Pc = F.softmax(pred_ts.float(), 1); brk = Pc[:, 0] > cfg_v.brake_uncertainty_threshold
+                ctrl[c]["brk"] += brk.tolist(); ctrl[c]["v"] += torch.where(brk, torch.zeros_like(Pc[:, 0]), Pc @ spd_t).tolist()
             if c == "v2x_r1.0" and getattr(net_v, "_aux_logit", None) is not None: aux_logits += net_v._aux_logit.tolist(); aux_labels += occ.float().tolist()
             acc[c] += int((pred_ts.argmax(1) == ts_label).sum()); ce[c] += float(F.cross_entropy(pred_ts, ts_label, reduction="sum"))
             l1[c] += float((pred_ckpt - ckpt_label).abs().mean(dim=(1, 2)).sum())
@@ -127,11 +135,39 @@ if dist["p_r1_rnd"]:
         v = np.array(v); print(f"  {k:11s} all {v.mean():.4f}   occ {v[occ_sel].mean() if occ_sel.any() else float('nan'):.4f}")
     print(f"  CONTENT GAP (occ frames, accuracy r1 − rnd): {100*(strat['occ']['v2x_r1.0'] - strat['occ']['v2x_r1.0_rnd']):+.1f} pt;  "
           f"R0 GAP (all frames, accuracy r0 − base): {100*(acc['v2x_r0'] - acc['base'])/n:+.1f} pt")
+# FIX / BREAK vs the --base model (the paired control), per frame: fix = base wrong & condition right, break = base right & condition wrong.
+fixbreak = {}
+cb = np.array(correct["base"], dtype=bool)
+print(f"\nFIX/BREAK vs base (frames; base wrong {int((~cb).sum())}, base right {int(cb.sum())} of {n})")
+for c in ("v2x_r1.0", "v2x_r1.0_rnd", "v2x_r0"):
+    if len(correct[c]) != n: continue
+    cc = np.array(correct[c], dtype=bool); fx = int((~cb & cc).sum()); br = int((cb & ~cc).sum())
+    fixbreak[c] = dict(fix=fx, brk=br, net=fx - br, base_wrong=int((~cb).sum()), base_right=int(cb.sum()))
+    print(f"  {c:14s} fix {fx:5d} ({100*fx/max(1,(~cb).sum()):5.1f}% of base-wrong)  break {br:5d} ({100*br/max(1,cb.sum()):4.2f}% of base-right)  net {fx-br:+5d}")
+# controller-aligned metrics on every frame of the set: |v_ctrl - v_expert|, brake recall on expert-stop frames, false brakes elsewhere,
+# and FIX/BREAK of the brake decision (correct = brake triggered iff expert stops) vs the --base model.
+ctrl_m = {}; ve = np.array(v_exp); stop = np.array(strata["stop_label"], dtype=bool)
+bc = np.array(ctrl["base"]["brk"], dtype=bool) == stop
+print(f"\nCONTROLLER-ALIGNED (brake if P(stop) > {cfg_v.brake_uncertainty_threshold}, else expected speed); expert-stop frames {int(stop.sum())} of {n}")
+for c in CTRL_C:
+    if len(ctrl[c]["v"]) != n: continue
+    v = np.array(ctrl[c]["v"]); b = np.array(ctrl[c]["brk"], dtype=bool); ok = b == stop
+    fx = int((~bc & ok).sum()) if c != "base" else 0; br = int((bc & ~ok).sum()) if c != "base" else 0
+    ctrl_m[c] = dict(speed_mae=float(np.abs(v - ve).mean()), speed_mae_stop=float(np.abs(v - ve)[stop].mean()) if stop.any() else None,
+                     brake_recall=float(b[stop].mean()) if stop.any() else None, false_brake=float(b[~stop].mean()) if (~stop).any() else None,
+                     brake_fix=fx, brake_break=br)
+    m = ctrl_m[c]
+    print(f"  {c:14s} |v-v_exp| {m['speed_mae']:.3f} m/s (expert-stop frames {m['speed_mae_stop'] if m['speed_mae_stop'] is not None else float('nan'):.3f})  brake recall {100*(m['brake_recall'] or 0):5.1f}%  false brake {100*(m['false_brake'] or 0):5.2f}%"
+          + (f"  brake-decision fix {fx} break {br} net {fx-br:+d}" if c != "base" else ""))
+np.savez_compressed(os.path.splitext(a.out)[0] + "_perframe.npz", idx=np.array(idx), occ=np.array(strata["occ"], dtype=bool),
+                    v_exp=ve, stop=stop, **{c.replace(".", "_"): np.array(correct[c], dtype=bool) for c in conds if len(correct[c]) == n},
+                    **{"v_" + c.replace(".", "_"): np.array(ctrl[c]["v"]) for c in CTRL_C if len(ctrl[c]["v"]) == n},
+                    **{"brk_" + c.replace(".", "_"): np.array(ctrl[c]["brk"], dtype=bool) for c in CTRL_C if len(ctrl[c]["brk"]) == n})
 aux_auc = None
 if aux_logits:
     from sklearn.metrics import roc_auc_score
     aux_auc = float(roc_auc_score(aux_labels, aux_logits)) if 0 < sum(aux_labels) < len(aux_labels) else None
     print(f"aux hidden-hazard head at rate 1: AUC {aux_auc:.3f} (positives {100*np.mean(aux_labels):.1f}%)" if aux_auc else "aux head: degenerate labels")
-json.dump(dict(n=n, strata=strat, aux_auc=aux_auc, acc={c: acc[c]/n for c in conds}, ce={c: ce[c]/n for c in conds}, l1={c: l1[c]/n for c in conds}, fill_mean=float(fill.mean()), frac_any_null=any_null/n),
+json.dump(dict(n=n, strata=strat, fixbreak=fixbreak, controller=ctrl_m, aux_auc=aux_auc, acc={c: acc[c]/n for c in conds}, ce={c: ce[c]/n for c in conds}, l1={c: l1[c]/n for c in conds}, fill_mean=float(fill.mean()), frac_any_null=any_null/n),
           open(a.out, "w"), indent=1)
 print("RATE_SWEEP_DONE")
