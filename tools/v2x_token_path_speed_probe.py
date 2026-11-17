@@ -5,7 +5,8 @@ improve the target-speed prediction only, or also the path (checkpoint) predicti
 Frames: a seeded random subset (seed 0) of the full TF++ dataset, un-augmented (augment_percentage 0, no colour / lidar aug),
 identical for every condition and both models; --shard/--nshard split it into disjoint slices (merge with --merge).
 Conditions (token model only): a = GT tokens as stored; b = all tokens cleared (mask 0, null-filled as in closed loop);
-c = velocity dims (vx/10, vy/10) zeroed, everything else kept; d = tokens (states + mask) rolled by one sample in the batch.
+c = velocity dims (vx/10, vy/10) zeroed, everything else kept; d = tokens (states + mask) rolled by one sample in the batch;
+e = the same frame's 16 slots (states + mask together) in a random order (same vehicles, slot identity changed; HANDOVER 10169).
 base = the sensor-only model (no tokens).
 Per frame and condition: checkpoint L1 (mean over 10 checkpoints and x/y, m) plus its lateral (y) part, target-speed argmax
 correct, expected speed (sum_k P_k v_k) and controller speed (0 if P(stop) > brake_uncertainty_threshold); expert speed =
@@ -29,7 +30,8 @@ ap.add_argument("--merge", type=int, default=0, help="1: only merge <out>_shard*
 ap.add_argument("--heldout", type=int, default=0, help="1: --root holds only routes the training filter drops (expert score < 100, "
                 "data.py:101-117); the filter is bypassed while the dataset index is built so those routes are loaded")
 a = ap.parse_args()
-CONDS = ["base", "a_gt", "b_clear", "c_novel", "d_shuffle"]
+CONDS = ["base", "a_gt", "b_clear", "c_novel", "d_shuffle", "e_perm"]
+TOKC = ("b_clear", "c_novel", "d_shuffle", "e_perm")
 
 
 def report(D):
@@ -43,7 +45,7 @@ def report(D):
         res[c] = r
         print(f"{c:10s} {r['ckpt_l1']:9.3f} {r['lat_l1']:8.3f} {100*r['ts_acc']:8.2f} {r['speed_mae']:10.3f} {r['ctrl_speed_mae']:11.3f}")
     print("\noutput change vs a_gt (token model): mean |d ckpt| m, frames with max lateral shift > 0.5 m, mean |d E[v]| m/s, frames > 1 m/s")
-    for c in ("b_clear", "c_novel", "d_shuffle"):
+    for c in TOKC:
         r = res[c]; r["d_ckpt"] = float(D[c + "_dck"].mean()); r["frac_lat_gt05"] = float((D[c + "_dlat"] > 0.5).mean())
         r["d_v"] = float(D[c + "_dv"].mean()); r["frac_dv_gt1"] = float((D[c + "_dv"] > 1.0).mean())
         print(f"  {c:10s} {r['d_ckpt']:.3f}  {100*r['frac_lat_gt05']:5.2f}%  {r['d_v']:.3f}  {100*r['frac_dv_gt1']:5.2f}%")
@@ -91,9 +93,10 @@ g = torch.Generator().manual_seed(0)
 idx = torch.randperm(len(ds), generator=g)[: a.n].tolist()[a.shard:: a.nshard]
 dl = torch.utils.data.DataLoader(torch.utils.data.Subset(ds, idx), batch_size=a.bs, shuffle=False, num_workers=16, drop_last=True)
 print(f"dataset {len(ds)} frames; shard {a.shard}/{a.nshard}: {len(idx)} frames (drop_last batch {a.bs})", flush=True)
+gp = torch.Generator().manual_seed(1)   # e_perm: same slot permutations for every model
 spd_t = torch.tensor(cfg_v.target_speeds, dtype=torch.float32, device=dev); thr = cfg_v.brake_uncertainty_threshold
 K = {k: [] for k in ["v_exp", "lat10", "moving32"] + [c + s for c in CONDS for s in ("_l1", "_latl1", "_ok", "_ev", "_vc")]
-     + [c + s for c in ("b_clear", "c_novel", "d_shuffle") for s in ("_dck", "_dlat", "_dv")]}
+     + [c + s for c in TOKC for s in ("_dck", "_dlat", "_dv")]}
 out_path = f"{a.out}_shard{a.shard}.npz"
 
 
@@ -115,8 +118,10 @@ with torch.no_grad():
         dist = torch.linalg.norm(st[..., :2] * 32.0, dim=-1); spd = torch.linalg.norm(st[..., 2:4] * 10.0, dim=-1)
         K["moving32"] += ((mk > 0.5) & (dist < 32.0) & (spd > 1.0)).any(1).tolist()
         sv = st.clone(); sv[..., 2:4] = 0.0
+        perm = torch.stack([torch.randperm(st.shape[1], generator=gp) for _ in range(st.shape[0])]).to(dev)   # per-frame slot order
+        sp = torch.gather(st, 1, perm[..., None].expand_as(st)); mp = torch.gather(mk, 1, perm)
         inputs = {"a_gt": (st, mk), "b_clear": (torch.zeros_like(st), torch.zeros_like(mk)), "c_novel": (sv, mk),
-                  "d_shuffle": (torch.roll(st, 1, 0), torch.roll(mk, 1, 0))}
+                  "d_shuffle": (torch.roll(st, 1, 0), torch.roll(mk, 1, 0)), "e_perm": (sp, mp)}
         outs = {}
         for c in CONDS:
             if c == "base":
@@ -128,7 +133,7 @@ with torch.no_grad():
             vc = torch.where(P[:, 0] > thr, torch.zeros_like(ev), ev); outs[c] = (pck, ev)
             K[c + "_l1"] += (pck - ck).abs().mean(dim=(1, 2)).tolist(); K[c + "_latl1"] += (pck[..., 1] - ck[..., 1]).abs().mean(1).tolist()
             K[c + "_ok"] += (pts.argmax(1) == ts_label).tolist(); K[c + "_ev"] += ev.tolist(); K[c + "_vc"] += vc.tolist()
-        for c in ("b_clear", "c_novel", "d_shuffle"):
+        for c in TOKC:
             d = outs[c][0] - outs["a_gt"][0]
             K[c + "_dck"] += d.abs().mean(dim=(1, 2)).tolist(); K[c + "_dlat"] += d[..., 1].abs().amax(1).tolist()
             K[c + "_dv"] += (outs[c][1] - outs["a_gt"][1]).abs().tolist()
