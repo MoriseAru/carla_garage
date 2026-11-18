@@ -67,6 +67,7 @@ class ObjQueryTokens(nn.Module):
     memory = torch.cat((m, self.ego_in(ego_token)), dim=1)
     self.last_memory_shape = (int(h), int(w), int(memory.shape[1]))   # logging only
     feat = self.decoder(self.query.expand(bs, -1, -1), memory)
+    self.last_feat = feat.detach()   # logging only (smoke diagnostics)
     state = self.state_head(feat)
     exist = self.exist_head(feat).squeeze(-1)
     tok = self.to_planner(feat) + sine_xy(state[..., :2] * 32.0, self.d_out)

@@ -59,6 +59,14 @@ assert not unexp and miss and all(k.startswith("obj_query.") for k in miss), (mi
 n_new = sum(p.numel() for n, p in net.named_parameters() if n.startswith("obj_query."))
 print(f"missing keys = obj_query.* only ({len(miss)} tensors, {n_new} params)", flush=True)
 from obj_query_tokens import hungarian_loss  # noqa: E402
+
+
+def qcos():
+    """mean / max pairwise cosine similarity of the 16 query output features (and of the predicted states) per frame."""
+    f = torch.nn.functional.normalize(net.obj_query.last_feat.float(), dim=-1); c = f @ f.transpose(1, 2)
+    n = c.shape[1]; off = c[:, ~torch.eye(n, dtype=torch.bool, device=c.device)]
+    st_ = net._objq["state"].float(); spread = (st_[..., :2] * 32).std(dim=1).mean().item()
+    return f"cos mean {off.mean().item():.4f} min {off.min().item():.4f}; xy spread across queries {spread:.2f} m"
 st, mk = batch["objq_state"].to(dev), batch["objq_mask"].to(dev)
 print("labels: objq_state", tuple(st.shape), "valid per frame", mk.sum(1).tolist(), "x,y range (m)",
       float(st[..., :2][mk > 0.5].abs().max()) * 32, "speed max (m/s)", float(st[..., 2][mk > 0.5].max()) * 10, flush=True)
@@ -97,7 +105,11 @@ for s in range(1, a.steps + 1):
         with torch.no_grad():
             fwd(); _, ste = hungarian_loss(net._objq, st, mk)
         net.obj_query.train()
-        print(f"overfit step {s} loss {float(l):.4f} pos_err {stt['pos_err_m']:.3f} m l1 {stt['l1']:.4f} bce {stt['bce']:.4f} | eval pos_err {ste['pos_err_m']:.3f} m ({time.time()-t0:.0f}s)", flush=True)
+        ce = qcos()
+        with torch.no_grad():
+            fwd()
+        ct = qcos()
+        print(f"overfit step {s} loss {float(l):.4f} pos_err {stt['pos_err_m']:.3f} m l1 {stt['l1']:.4f} bce {stt['bce']:.4f} | eval pos_err {ste['pos_err_m']:.3f} m ({time.time()-t0:.0f}s)\n    eval  {ce}\n    train {ct}", flush=True)
 net.obj_query.eval()
 with torch.no_grad():
     fwd(); _, stt = hungarian_loss(net._objq, st, mk)

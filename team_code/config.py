@@ -839,6 +839,7 @@ class GlobalConfig:
     self.obj_query_n = 16
     self.obj_query_radius = 32.0
     self.obj_query_layers = 4
+    self.obj_query_lr_mult = 1.0   # lr multiplier of obj_query.* (own param group); 1.0 = same lr as the rest
     self.obj_query_pool = 1   # average-pool factor of bev_feature_grid before the queries read it (1 = full 64 x 64)
     # scheme C: make the tokens worth reading. Frames where a CONNECTED vehicle is hidden from the ego's lidar, is a moving
     # hazard ahead, and the expert slows down get v2x_occ_weight x loss on the planning heads; an auxiliary head must

@@ -123,6 +123,7 @@ def main():
                       help='Scheme C: extra loss weight on every frame with a connected hidden hazard (1 = off).')
   parser.add_argument('--use_obj_query_tokens', type=int, default=config.use_obj_query_tokens,
                       help='1: LEAD-style implicit object-query tokens (no radar) in the decoder memory (HANDOVER 10947).')
+  parser.add_argument('--obj_query_lr_mult', type=float, default=1.0, help='lr multiplier of the obj_query.* parameters (own param group).')
   parser.add_argument('--obj_query_radius', type=float, default=config.obj_query_radius, help='Label radius (m) of the object queries.')
   parser.add_argument('--use_v2x_aux_reg', type=int, default=config.use_v2x_aux_reg,
                       help='Scheme C+: regress the nearest connected hidden hazard state (only knowable from the token).')
@@ -698,6 +699,12 @@ def main():
     params = [{'params': [p_ for n_, p_ in named if not n_.startswith('coop_')]},
               {'params': [p_ for n_, p_ in named if n_.startswith('coop_')], 'lr': args.lr * float(config.v2x_plugin_lr_mult)}]
     assert len(params[1]['params']) > 0, 'v2x_plugin_lr_mult: no coop_* parameters'
+  if float(getattr(config, 'obj_query_lr_mult', 1.0)) != 1.0:   # implicit object queries in their own group (SGDR scales it too)
+    assert not config.use_optim_groups and float(getattr(config, 'v2x_plugin_lr_mult', 1.0)) == 1.0
+    named = list(model.module.named_parameters())
+    params = [{'params': [p_ for n_, p_ in named if not n_.startswith('obj_query.')]},
+              {'params': [p_ for n_, p_ in named if n_.startswith('obj_query.')], 'lr': args.lr * float(config.obj_query_lr_mult)}]
+    assert len(params[1]['params']) > 0, 'obj_query_lr_mult: no obj_query.* parameters'
 
   if args.compile:
     model = torch.compile(model, mode=args.compile_mode)
