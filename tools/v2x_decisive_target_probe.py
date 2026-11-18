@@ -50,6 +50,7 @@ def report(D):
     r["att_per_layer_top1"] = [float((D["rank_layers"][:, l] == 0).mean()) for l in range(D["rank_layers"].shape[1])]
     r["infl_top1"] = float((D["rank_infl"] == 0).mean()); r["infl_top3"] = float((D["rank_infl"] < 3).mean())
     r["infl_decisive_mean_abs_dEv"] = float(D["dv_dec"].mean()); r["infl_max_mean_abs_dEv"] = float(D["dv_max"].mean())
+    r["infl_decisive_frac_dEv_gt1"] = float((D["dv_dec"] > 1.0).mean())
     r["infl_top1_when_max_dEv_gt_0.1"] = float((D["rank_infl"][D["dv_max"] > 0.1] == 0).mean()) if (D["dv_max"] > 0.1).any() else None
     r["frames_max_dEv_gt_0.1"] = int((D["dv_max"] > 0.1).sum())
     r["att_infl_same_slot_last"] = float(D["att_infl_same"].mean())

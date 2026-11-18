@@ -24,6 +24,7 @@ ap.add_argument("--root", default="/work/gn21/n21001/carla_garage_data_root")
 ap.add_argument("--v2x", default="/work/gn21/n21001/carla_garage_runs/tfpp_v2x_000")
 ap.add_argument("--base", default="/work/gn21/n21001/carla_garage_runs/tfpp_base_000")
 ap.add_argument("--n", type=int, default=20000); ap.add_argument("--bs", type=int, default=16)
+ap.add_argument("--offset", type=int, default=0, help="frames perm[offset : offset + n] of the seed-0 permutation (0 = the earlier probes)")
 ap.add_argument("--shard", type=int, default=0); ap.add_argument("--nshard", type=int, default=1)
 ap.add_argument("--out", default="/work/gn21/n21001/V2XState_Real/tmp/v2x_token_probe")
 ap.add_argument("--merge", type=int, default=0, help="1: only merge <out>_shard*.npz and print the tables")
@@ -94,7 +95,7 @@ if a.heldout:
 ds = datamod.CARLA_Data(root=cfg_v.data_roots, config=cfg_v, estimate_class_distributions=False, estimate_sem_distribution=False, shared_dict=None, rank=0)
 datamod.ujson = _ujson
 g = torch.Generator().manual_seed(0)
-idx = torch.randperm(len(ds), generator=g)[: a.n].tolist()[a.shard:: a.nshard]
+idx = torch.randperm(len(ds), generator=g)[a.offset: a.offset + a.n].tolist()[a.shard:: a.nshard]
 dl = torch.utils.data.DataLoader(torch.utils.data.Subset(ds, idx), batch_size=a.bs, shuffle=False, num_workers=16, drop_last=True)
 print(f"dataset {len(ds)} frames; shard {a.shard}/{a.nshard}: {len(idx)} frames (drop_last batch {a.bs})", flush=True)
 gp = torch.Generator().manual_seed(1)   # e_perm: same slot permutations for every model

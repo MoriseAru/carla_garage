@@ -25,7 +25,8 @@ ap.add_argument("--attn_w", type=float, default=0.0, help="> 0: decisive-vehicle
                 "heads and layers averaged, renormalised over valid token slots; -log p[slot of speed_reduced_by_obj_id]")
 ap.add_argument("--lon", type=int, default=0, help="1: longitudinal-only token routing masks in the decoder (tools/v2x_lon_mask.py)")
 ap.add_argument("--src", default="/work/gn21/n21001/carla_garage_runs/tfpp_v2x_000")
-ap.add_argument("--out", required=True)
+ap.add_argument("--out", required=True, help="output dir; may contain {s}, replaced by the step count (needed with --save_at)")
+ap.add_argument("--save_at", default="", help="comma-separated steps at which to also save a checkpoint (dose curve, LOCAL 10766)")
 ap.add_argument("--root", default="/work/gn21/n21001/carla_garage_data_root")
 ap.add_argument("--steps", type=int, default=2000); ap.add_argument("--bs", type=int, default=16)
 ap.add_argument("--lr", type=float, default=1e-4); ap.add_argument("--workers", type=int, default=32)
@@ -112,6 +113,29 @@ class _DecSlot(torch.utils.data.Dataset):
 dl = torch.utils.data.DataLoader(_DecSlot(ds, idx) if a.attn_w > 0 else torch.utils.data.Subset(ds, idx), batch_size=a.bs, shuffle=False, num_workers=a.workers,
                                  drop_last=True, worker_init_fn=lambda w: np.random.seed(1000 + w))
 print(f"dataset {len(ds)} frames; using {len(idx)}; setup {time.time()-t0:.0f}s", flush=True)
+save_at = sorted({int(x) for x in a.save_at.split(",") if x.strip()})
+assert not save_at or "{s}" in a.out, "--save_at needs {s} in --out"
+
+
+def save(step):
+    out = a.out.replace("{s}", str(step))
+    assert torch.equal(net.coop_slot_embedding.weight.detach(), slot_before), "slot embedding changed"
+    os.makedirs(out, exist_ok=True)
+    out_sd = {k: v.detach().cpu() for k, v in net.state_dict().items()}
+    assert list(out_sd.keys()) == list(sd.keys()) and all(out_sd[k].shape == sd[k].shape for k in sd), "state_dict keys differ"
+    changed = sorted({k for k in sd if not torch.equal(out_sd[k], sd[k])})
+    print(f"[save step {step}] {len(changed)} tensors changed vs source: {changed}", flush=True)
+    torch.save(out_sd, os.path.join(out, "model_0030.pth"))
+    shutil.copy(os.path.join(a.src, "config.json"), os.path.join(out, "config.json"))
+    args_src = json.load(open(os.path.join(a.src, "args.txt")))
+    args_src["id"] = os.path.basename(out.rstrip("/"))
+    args_src["finetune"] = dict(vars(a), source=os.path.join(a.src, "model_0030.pth"), steps_done=step, trainable=train_names,
+                                loss="0.1*loss_target_speed + 0.1*loss_checkpoint" + (f" + {a.attn_w}*decisive-vehicle attention NLL" if a.attn_w > 0 else ""), net_mode="eval (frozen BN/dropout)" + ("; join/checkpoint_decoder/target_speed_network in train mode" if a.train_dec else ""),
+                                inference_note="needs V2X_LON_ONLY=1 (decoder masks)" if a.lon else "plain decoder")
+    json.dump(args_src, open(os.path.join(out, "args.txt"), "w"), indent=2)
+    print(f"SAVED step {step} -> {out} ({time.time()-t0:.0f}s)", flush=True)
+
+
 opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=a.lr, amsgrad=True)
 w_ts, w_ck = float(cfg.detailed_loss_weights["loss_target_speed"]), float(cfg.detailed_loss_weights["loss_checkpoint"])
 t1 = time.time(); step = 0; run = []; run_at = []
@@ -143,20 +167,9 @@ for data in dl:
         m = np.mean(run[-100:], 0)
         ma = np.mean(run_at[-100:], 0) if run_at else (0.0, 0.0)
         print(f"step {step} ts {m[0]:.4f} ckpt {m[1]:.4f} attn {ma[0]:.4f} (frames {ma[1]:.2f}) {(time.time()-t1)/step:.3f}s/step", flush=True)
+    if step in save_at and step != a.steps:
+        save(step)
     if (time.time() - t1) / 60.0 > a.max_min:
         print(f"WALL GUARD hit at step {step}", flush=True); break
-assert torch.equal(net.coop_slot_embedding.weight.detach(), slot_before), "slot embedding changed"
-os.makedirs(a.out, exist_ok=True)
-out_sd = {k: v.detach().cpu() for k, v in net.state_dict().items()}
-assert list(out_sd.keys()) == list(sd.keys()) and all(out_sd[k].shape == sd[k].shape for k in sd), "state_dict keys differ"
-changed = sorted({k for k in sd if not torch.equal(out_sd[k], sd[k])})
-print("tensors changed vs source:", changed, flush=True)
-torch.save(out_sd, os.path.join(a.out, "model_0030.pth"))
-shutil.copy(os.path.join(a.src, "config.json"), os.path.join(a.out, "config.json"))
-args_src = json.load(open(os.path.join(a.src, "args.txt")))
-args_src["id"] = os.path.basename(a.out.rstrip("/"))
-args_src["finetune"] = dict(vars(a), source=os.path.join(a.src, "model_0030.pth"), steps_done=step, trainable=train_names,
-                            loss="0.1*loss_target_speed + 0.1*loss_checkpoint" + (f" + {a.attn_w}*decisive-vehicle attention NLL" if a.attn_w > 0 else ""), net_mode="eval (frozen BN/dropout)" + ("; join/checkpoint_decoder/target_speed_network in train mode" if a.train_dec else ""),
-                            inference_note="needs V2X_LON_ONLY=1 (decoder masks)" if a.lon else "plain decoder")
-json.dump(args_src, open(os.path.join(a.out, "args.txt"), "w"), indent=2)
+save(step)
 print(f"FINETUNE_DONE {a.mode} steps {step} out {a.out} total {time.time()-t0:.0f}s", flush=True)
