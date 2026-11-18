@@ -23,11 +23,20 @@ ap.add_argument("--n", type=int, default=20000); ap.add_argument("--bs", type=in
 ap.add_argument("--shard", type=int, default=0); ap.add_argument("--nshard", type=int, default=1)
 ap.add_argument("--out", default="/work/gn21/n21001/V2XState_Real/tmp/v2x_decisive")
 ap.add_argument("--merge", type=int, default=0)
+ap.add_argument("--lon", type=int, default=0, help="1: install the longitudinal-only decoder masks (tools/v2x_lon_mask.py)")
+ap.add_argument("--offset", type=int, default=0, help="frames perm[offset : offset + n] of the seed-0 permutation "
+                "(24000: frames the 1500-step x 16 fine-tunes did not use)")
 a = ap.parse_args()
 
 
 def report(D):
-    r = {"frames_total": int(D["n_frames"].sum()), "frames_with_decisive_id": int(D["n_dec"].sum()),
+    groups = {}
+    if len(D["slot"]):
+        s_, mv = D["slot"], D["dspeed"] > 0.5
+        for g, m in [("nearest", s_ == 0), ("not_nearest", s_ >= 1), ("slot_ge3", s_ >= 3), ("moving", mv), ("static", ~mv)]:
+            groups[g] = dict(n=int(m.sum()), chance_top1=float((1.0 / D["nvalid"][m]).mean()), att_last_top1=float((D["rank_last"][m] == 0).mean()),
+                             att_mean_top1=float((D["rank_mean"][m] == 0).mean()), infl_top1=float((D["rank_infl"][m] == 0).mean()))
+    r = {"groups": groups,"frames_total": int(D["n_frames"].sum()), "frames_with_decisive_id": int(D["n_dec"].sum()),
          "frames_decisive_in_token_slots": int(len(D["slot"]))}
     n = len(D["slot"])
     if n == 0:
@@ -65,6 +74,9 @@ cfg = cfgmod.GlobalConfig(); saved = jsonpickle.decode(open(os.path.join(a.v2x, 
 net = modmod.LidarCenterNet(cfg)
 net.load_state_dict(torch.load(os.path.join(a.v2x, "model_0030.pth"), map_location="cpu"), strict=True)
 net.to(dev).eval()
+if a.lon:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import v2x_lon_mask; v2x_lon_mask.install(net)
+    print("lon-only decoder masks installed", flush=True)
 P, K, R = int(cfg.predict_checkpoint_len), int(cfg.v2x_k), float(cfg.v2x_radius)
 assert not cfg.input_path_to_target_speed_network
 
@@ -93,7 +105,7 @@ cfg.initialize(root_dir=[a.root], setting="all", use_v2x=1, use_v2x_bev=0)
 cfg.augment_percentage = 0.0; cfg.use_color_aug = 0; cfg.lidar_aug_prob = 0.0
 ds = datamod.CARLA_Data(root=cfg.data_roots, config=cfg, estimate_class_distributions=False, estimate_sem_distribution=False,
                         shared_dict=None, rank=0)
-idx = torch.randperm(len(ds), generator=torch.Generator().manual_seed(0))[: a.n].tolist()[a.shard:: a.nshard]
+idx = torch.randperm(len(ds), generator=torch.Generator().manual_seed(0))[a.offset: a.offset + a.n].tolist()[a.shard:: a.nshard]
 dl = torch.utils.data.DataLoader(torch.utils.data.Subset(ds, idx), batch_size=a.bs, shuffle=False, num_workers=16, drop_last=True)
 cur = cfg.seq_len - 1
 spd_t = torch.tensor(cfg.target_speeds, dtype=torch.float32, device=dev)
