@@ -139,6 +139,7 @@ def main():
   parser.add_argument('--v2x_kd_T', type=float, default=config.v2x_kd_T, help='Scheme R: distillation temperature (target speed).')
   parser.add_argument('--v2x_kd_w', type=float, default=config.v2x_kd_w, help='Scheme R: weight of each KD term, relative to the planning losses.')
   parser.add_argument('--save_every', type=int, default=0, help='>0: also keep model/optimizer files every N epochs (monitoring).')
+  parser.add_argument('--keep_epochs', type=str, default='', help="extra epochs whose model/optimizer/scheduler/scaler files are kept, ':'-separated, e.g. '22:26' (HANDOVER 11080)")
   parser.add_argument('--use_bridgedrive', type=int, default=config.use_bridgedrive,
                       help='BridgeDrive: anchor-guided diffusion-bridge checkpoint head instead of the GRU (post-train from a base checkpoint).')
   parser.add_argument('--bridgedrive_anchor_path', type=str, default=config.bridgedrive_anchor_path)
@@ -1289,6 +1290,8 @@ class Engine(object):
           keep_prev_epoch = True
       if getattr(self.args, 'save_every', 0) and self.cur_epoch % int(self.args.save_every) == 0:
         keep_prev_epoch = True   # epoch cur_epoch-1 is a monitoring checkpoint (every save_every epochs)
+      if str(self.cur_epoch - 1) in [e for e in str(getattr(self.args, 'keep_epochs', '')).replace(',', ':').split(':') if e]:
+        keep_prev_epoch = True   # requested late checkpoint for later resumes
       last_model_file = os.path.join(self.args.logdir, f'model_{self.cur_epoch - 1:04d}.pth')
       last_optimizer_file = os.path.join(self.args.logdir, f'optimizer_{self.cur_epoch - 1:04d}.pth')
       last_scaler_file = os.path.join(self.args.logdir, f'scaler_{self.cur_epoch - 1:04d}.pth')
