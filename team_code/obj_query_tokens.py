@@ -37,7 +37,7 @@ class ObjQueryTokens(nn.Module):
                pool=1):
     super().__init__()
     self.n_query, self.pool, self.d_model = n_query, int(pool), d_model
-    self.query = nn.Parameter(torch.randn(1, n_query, d_model) * 0.02)
+    self.query = nn.Parameter(torch.randn(1, n_query, d_model))   # N(0, 1) as nn.Embedding / DETR: with std 0.02 the queries start near-identical and only dropout noise separates them (smoke 2026-11-19: eval collapse)
     self.bev_in = nn.Conv2d(d_bev, d_model, kernel_size=1)
     self.ego_in = nn.Identity() if d_ego == d_model else nn.Linear(d_ego, d_model)
     layer = nn.TransformerDecoderLayer(d_model, n_heads, d_ff, dropout, activation=nn.GELU(), batch_first=True)

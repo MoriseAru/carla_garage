@@ -14,6 +14,7 @@ ap.add_argument("--src", default="/work/gn21/n21001/carla_garage_runs/tfpp_base_
 ap.add_argument("--root", default="/work/gn21/n21001/carla_garage_data_root")
 ap.add_argument("--out", default="/work/gn21/n21001/V2XState_Real/tmp/objq_smoke")
 ap.add_argument("--bs", type=int, default=8); ap.add_argument("--steps", type=int, default=600)
+ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--dropout0", type=int, default=0, help="1: obj_query dropout 0 during the overfit (diagnostic)")
 a = ap.parse_args()
 sys.path.insert(0, a.code)
 import jsonpickle, jsonpickle.ext.numpy as jpn; jpn.register_handlers()  # noqa: E402
@@ -81,13 +82,22 @@ print("base config detailed_loss_weights (as stored, already normalised):", w, f
 for n, p in net.named_parameters():
     p.requires_grad_(n.startswith("obj_query."))
 net.eval(); net.obj_query.train()
-opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=3e-4)
+opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=a.lr)
+if a.dropout0:
+    for m_ in net.obj_query.modules():
+        if isinstance(m_, torch.nn.Dropout): m_.p = 0.0
+        if isinstance(m_, torch.nn.MultiheadAttention): m_.dropout = 0.0
+print("overfit: lr", a.lr, "dropout0", a.dropout0, flush=True)
 t0 = time.time()
 for s in range(1, a.steps + 1):
     fwd(); l, stt = hungarian_loss(net._objq, st, mk)
     opt.zero_grad(); l.backward(); opt.step()
-    if s % 50 == 0 or s == 1:
-        print(f"overfit step {s} loss {float(l):.4f} pos_err {stt['pos_err_m']:.3f} m l1 {stt['l1']:.4f} bce {stt['bce']:.4f} ({time.time()-t0:.0f}s)", flush=True)
+    if s % 250 == 0 or s == 1:
+        net.obj_query.eval()
+        with torch.no_grad():
+            fwd(); _, ste = hungarian_loss(net._objq, st, mk)
+        net.obj_query.train()
+        print(f"overfit step {s} loss {float(l):.4f} pos_err {stt['pos_err_m']:.3f} m l1 {stt['l1']:.4f} bce {stt['bce']:.4f} | eval pos_err {ste['pos_err_m']:.3f} m ({time.time()-t0:.0f}s)", flush=True)
 net.obj_query.eval()
 with torch.no_grad():
     fwd(); _, stt = hungarian_loss(net._objq, st, mk)
