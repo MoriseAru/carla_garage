@@ -19,6 +19,9 @@ import config as cfgmod, model as modmod, data as datamod  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--mode", choices=["set", "ctl"], required=True)
+ap.add_argument("--train_dec", type=int, default=0, help="1: also train join, checkpoint_decoder, target_speed_network, "
+                "checkpoint_query (LOCAL 10328); these modules are put in train mode")
+ap.add_argument("--lon", type=int, default=0, help="1: longitudinal-only token routing masks in the decoder (tools/v2x_lon_mask.py)")
 ap.add_argument("--src", default="/work/gn21/n21001/carla_garage_runs/tfpp_v2x_000")
 ap.add_argument("--out", required=True)
 ap.add_argument("--root", default="/work/gn21/n21001/carla_garage_data_root")
@@ -37,13 +40,19 @@ if a.mode == "set":
     with torch.no_grad():
         net.coop_slot_embedding.weight.zero_()
 for n, p in net.named_parameters():
-    p.requires_grad_(n.startswith("coop_proj.") or n == "coop_null")
+    p.requires_grad_(n.startswith("coop_proj.") or n == "coop_null" or (a.train_dec and (
+        n.startswith(("join.", "checkpoint_decoder.", "target_speed_network.")) or n == "checkpoint_query")))
 train_names = [n for n, p in net.named_parameters() if p.requires_grad]
 print("trainable:", train_names, sum(p.numel() for p in net.parameters() if p.requires_grad), flush=True)
 net.to(dev).eval()
 for m_ in net.modules():   # as train.py --v2x_freeze_base: RNNs stay in train mode (cudnn has no eval-mode backward;
     if isinstance(m_, torch.nn.RNNBase):   # single-layer GRU without dropout -> identical output)
         m_.training = True
+if a.train_dec:
+    for mod in (net.join, net.checkpoint_decoder, net.target_speed_network):
+        mod.train()
+if a.lon:
+    import v2x_lon_mask; v2x_lon_mask.install(net); print("lon-only decoder masks installed", flush=True)
 slot_before = net.coop_slot_embedding.weight.detach().clone()
 
 cfg.initialize(root_dir=[a.root], setting="all", use_v2x=1, use_v2x_bev=0)
@@ -85,6 +94,7 @@ shutil.copy(os.path.join(a.src, "config.json"), os.path.join(a.out, "config.json
 args_src = json.load(open(os.path.join(a.src, "args.txt")))
 args_src["id"] = os.path.basename(a.out.rstrip("/"))
 args_src["finetune"] = dict(vars(a), source=os.path.join(a.src, "model_0030.pth"), steps_done=step, trainable=train_names,
-                            loss="0.1*loss_target_speed + 0.1*loss_checkpoint", net_mode="eval (frozen BN/dropout)")
+                            loss="0.1*loss_target_speed + 0.1*loss_checkpoint", net_mode="eval (frozen BN/dropout)" + ("; join/checkpoint_decoder/target_speed_network in train mode" if a.train_dec else ""),
+                            inference_note="needs V2X_LON_ONLY=1 (decoder masks)" if a.lon else "plain decoder")
 json.dump(args_src, open(os.path.join(a.out, "args.txt"), "w"), indent=2)
 print(f"FINETUNE_DONE {a.mode} steps {step} out {a.out} total {time.time()-t0:.0f}s", flush=True)

@@ -27,6 +27,7 @@ ap.add_argument("--n", type=int, default=20000); ap.add_argument("--bs", type=in
 ap.add_argument("--shard", type=int, default=0); ap.add_argument("--nshard", type=int, default=1)
 ap.add_argument("--out", default="/work/gn21/n21001/V2XState_Real/tmp/v2x_token_probe")
 ap.add_argument("--merge", type=int, default=0, help="1: only merge <out>_shard*.npz and print the tables")
+ap.add_argument("--lon", type=int, default=0, help="1: install the longitudinal-only decoder masks on the --v2x model")
 ap.add_argument("--heldout", type=int, default=0, help="1: --root holds only routes the training filter drops (expert score < 100, "
                 "data.py:101-117); the filter is bypassed while the dataset index is built so those routes are loaded")
 a = ap.parse_args()
@@ -75,6 +76,9 @@ def load(run_dir):
 
 
 cfg_v, net_v = load(a.v2x); cfg_b, net_b = load(a.base)
+if a.lon:
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__))); import v2x_lon_mask; v2x_lon_mask.install(net_v)
+    print("lon-only decoder masks installed on", a.v2x, flush=True)
 cfg_v.initialize(root_dir=[a.root], setting="all", use_v2x=1, use_v2x_bev=0)
 cfg_v.augment_percentage = 0.0; cfg_v.use_color_aug = 0; cfg_v.lidar_aug_prob = 0.0
 _ujson = datamod.ujson
