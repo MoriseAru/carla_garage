@@ -14,6 +14,7 @@ import laspy
 import io
 import transfuser_utils as t_u
 import v2x_features
+import obj_query_tokens
 import gaussian_target as g_t
 import random
 from sklearn.utils.class_weight import compute_class_weight
@@ -391,7 +392,8 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
         boxes_i = None
 
         # Load bounding boxes
-        if self.config.detect_boxes or self.config.use_plant or self.config.use_v2x or getattr(self.config, 'use_v2x_bev', 0):
+        if self.config.detect_boxes or self.config.use_plant or self.config.use_v2x or getattr(self.config, 'use_v2x_bev', 0) \
+            or getattr(self.config, 'use_obj_query_tokens', 0):
           with gzip.open(str(boxes[i], encoding='utf-8'), 'rt', encoding='utf-8') as f2:
             boxes_i = ujson.load(f2)
           if self.config.use_plant:
@@ -676,6 +678,11 @@ class CARLA_Data(Dataset):  # pylint: disable=locally-disabled, invalid-name
       # expert is slowing down / yielding: brake, or target speed clearly below current speed (both m/s)
       data['slowdown'] = np.float32(1.0 if (bool(current_measurement['brake']) or
                                             float(current_measurement['target_speed']) < float(current_measurement['speed']) - 1.0) else 0.0)
+
+    if getattr(self.config, 'use_obj_query_tokens', 0):   # Hungarian labels of the implicit object queries (HANDOVER 10947)
+      data['objq_state'], data['objq_mask'] = obj_query_tokens.labels_from_boxes(
+          loaded_boxes[self.config.seq_len - 1], k=self.config.obj_query_n, radius=self.config.obj_query_radius,
+          y_augmentation=aug_translation, yaw_augmentation=aug_rotation)
 
     if self.config.use_wp_gru:
       waypoints = self.get_waypoints(loaded_measurements[self.config.seq_len - 1:],

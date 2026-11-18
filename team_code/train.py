@@ -121,6 +121,9 @@ def main():
   parser.add_argument('--v2x_hidden_pts', type=int, default=config.v2x_hidden_pts, help='<= this many lidar points -> hidden.')
   parser.add_argument('--v2x_occ_weight_all', type=float, default=config.v2x_occ_weight_all,
                       help='Scheme C: extra loss weight on every frame with a connected hidden hazard (1 = off).')
+  parser.add_argument('--use_obj_query_tokens', type=int, default=config.use_obj_query_tokens,
+                      help='1: LEAD-style implicit object-query tokens (no radar) in the decoder memory (HANDOVER 10947).')
+  parser.add_argument('--obj_query_radius', type=float, default=config.obj_query_radius, help='Label radius (m) of the object queries.')
   parser.add_argument('--use_v2x_aux_reg', type=int, default=config.use_v2x_aux_reg,
                       help='Scheme C+: regress the nearest connected hidden hazard state (only knowable from the token).')
   parser.add_argument('--v2x_dual_head', type=int, default=config.v2x_dual_head,
@@ -559,6 +562,9 @@ def main():
     config.detailed_loss_weights['loss_hidden_hazard'] = 0.0
   if not getattr(config, 'use_v2x_aux_reg', 0):
     config.detailed_loss_weights['loss_hidden_reg'] = 0.0
+  if not getattr(config, 'use_obj_query_tokens', 0):
+    config.detailed_loss_weights['loss_obj_query'] = 0.0
+  assert not (getattr(config, 'use_obj_query_tokens', 0) and config.use_v2x), 'use_obj_query_tokens and use_v2x are mutually exclusive'
   if not (config.use_v2x and getattr(config, 'v2x_dual_head', 0)):
     config.detailed_loss_weights['loss_target_speed_sensor'] = 0.0
 
@@ -983,6 +989,10 @@ class Engine(object):
         lidar = data['lidar'].to(self.device, dtype=torch.float32)
 
       coop_states = coop_mask = None
+      objq_state = objq_mask = None
+      if getattr(self.config, 'use_obj_query_tokens', 0):
+        objq_state = data['objq_state'].to(self.device, dtype=torch.float32)
+        objq_mask = data['objq_mask'].to(self.device, dtype=torch.float32)
       occ_sample_weight = aux_label = aux_mask = aux_reg_label = aux_reg_mask = ts_sensor_mask = None
       if getattr(self.config, 'use_v2x_bev', 0):   # late fusion: raster of the received states appended to the lidar BEV (penetration 1 in training)
         bev_states = data['coop_states'].to(self.device, dtype=torch.float32); bev_mask = data['coop_mask'].to(self.device, dtype=torch.float32)
@@ -1091,7 +1101,9 @@ class Engine(object):
                             aux_mask=aux_mask,
                             aux_reg_label=aux_reg_label,
                             aux_reg_mask=aux_reg_mask,
-                            ts_sensor_mask=ts_sensor_mask)
+                            ts_sensor_mask=ts_sensor_mask,
+                            objq_state=objq_state,
+                            objq_mask=objq_mask)
       if self.config.use_v2x and not validation and getattr(self, 'teachers', None):
         losses.update(self.kd_losses(tok_sel, rgb, lidar, target_point, target_point_next, ego_vel, command, coop_states, coop_mask,
                                      pred_target_speed, pred_checkpoint))

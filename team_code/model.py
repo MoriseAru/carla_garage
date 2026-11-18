@@ -354,6 +354,13 @@ class LidarCenterNet(nn.Module):
             self.hidden_reg_head = nn.Sequential(nn.Linear(d_model, d_model), nn.ReLU(inplace=True), nn.Linear(d_model, 4))
 
         self.change_channel = nn.Conv2d(self.backbone.num_features, self.config.gru_input_size, kernel_size=1)
+        if getattr(self.config, 'use_obj_query_tokens', 0):   # HANDOVER 10947; built only when on (base state_dict / RNG unchanged)
+          assert not self.config.use_v2x, 'use_obj_query_tokens and use_v2x are mutually exclusive'
+          from obj_query_tokens import ObjQueryTokens   # pylint: disable=import-outside-toplevel
+          assert self.extra_sensors, 'use_obj_query_tokens reads the ego velocity token (use_velocity)'
+          self.obj_query = ObjQueryTokens(self.config.bev_features_chanels, self.config.gru_input_size,
+                                          n_query=self.config.obj_query_n, n_layers=self.config.obj_query_layers,
+                                          d_out=self.config.gru_input_size, pool=self.config.obj_query_pool)
 
         if self.config.use_wp_gru:
           if self.config.multi_wp_output:
@@ -555,6 +562,7 @@ class LidarCenterNet(nn.Module):
     self._aux_logit = None   # hidden-hazard auxiliary prediction (scheme C), read by compute_loss
     self._aux_reg = None     # nearest connected hidden hazard state regression (scheme C+)
     self._ts_sensor = None   # sensor-only target speed from the null-token decoder pass (scheme D), read by compute_loss
+    self._objq = None        # implicit object-query predictions (use_obj_query_tokens), read by compute_loss
     self._v2xs = None        # V2XState head outputs (gate, attention, basis, aux losses), read by compute_loss / the agent
     pred_bounding_box_early = pred_bev_semantic_early = None
     if self.config.two_tp_input:
@@ -610,6 +618,10 @@ class LidarCenterNet(nn.Module):
           if self.dual_head and also_sensor_only:   # same memory with every slot nulled: what the model sees without cooperation
             sensor_features = torch.cat((fused_features, self.coop_tokens(None, None, bs)), dim=1)
           fused_features = torch.cat((fused_features, self.coop_tokens(coop_states, coop_mask, bs)), dim=1)
+        if getattr(self.config, 'use_obj_query_tokens', 0):   # implicit object tokens join the memory where the state tokens would go
+          # memory: the detection BEV grid + the ego velocity/command token (last position of the planner memory here)
+          objq_tok, self._objq = self.obj_query(bev_feature_grid, fused_features[:, -1:])
+          fused_features = torch.cat((fused_features, objq_tok), dim=1)
         if self.config.use_wp_gru:
           if self.config.multi_wp_output:
             joined_wp_features = self.join(self.wp_query.repeat(bs, 1, 1), fused_features)
@@ -744,7 +756,7 @@ class LidarCenterNet(nn.Module):
                    semantic_label, bev_semantic_label, depth_label, center_heatmap_label, wh_label, yaw_class_label,
                    yaw_res_label, offset_label, velocity_label, brake_target_label, pixel_weight_label,
                    avg_factor_label, sample_weight=None, aux_label=None, aux_mask=None, aux_reg_label=None, aux_reg_mask=None,
-                   ts_sensor_mask=None):
+                   ts_sensor_mask=None, objq_state=None, objq_mask=None):
     loss = {}
     if self.config.use_wp_gru:
       if self.config.multi_wp_output:
@@ -788,6 +800,9 @@ class LidarCenterNet(nn.Module):
       per = F.cross_entropy(self._ts_sensor, target_speed_label, weight=self.loss_speed.weight,
                             label_smoothing=self.loss_speed.label_smoothing, reduction='none')
       loss.update({'loss_target_speed_sensor': torch.sum(per * ts_sensor_mask) / torch.clamp(ts_sensor_mask.sum(), min=1.0)})
+    if objq_state is not None and getattr(self, '_objq', None) is not None:
+      from obj_query_tokens import hungarian_loss   # pylint: disable=import-outside-toplevel
+      loss['loss_obj_query'], self._objq_stats = hungarian_loss(self._objq, objq_state, objq_mask)
     if aux_reg_label is not None and getattr(self, '_aux_reg', None) is not None:
       l1 = torch.abs(self._aux_reg - aux_reg_label).mean(dim=1)
       m = aux_reg_mask if aux_reg_mask is not None else torch.ones_like(l1)

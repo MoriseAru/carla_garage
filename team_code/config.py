@@ -507,6 +507,7 @@ class GlobalConfig:
         'loss_hidden_hazard': 1.0,
         'loss_hidden_reg': 1.0,
         'loss_target_speed_sensor': 1.0,
+        'loss_obj_query': 1.0,   # use_obj_query_tokens; zeroed by train.py otherwise
     }
     self.root_dir = ''
     self.val_towns = []
@@ -831,6 +832,14 @@ class GlobalConfig:
     self.v2x_p_zero = 0.25
     self.v2x_state_dim = 7
     self.v2x_radius = 64.0
+    # LEAD-style implicit object-query tokens without radar (LOCAL HANDOVER 10947): N learnable queries read the planner's
+    # decoder memory, are Hungarian-supervised on the N nearest vehicles' (x, y, speed) within obj_query_radius, and their
+    # features (+ sine encoding of the predicted x, y) join the decoder memory. Mutually exclusive with use_v2x. Off = base.
+    self.use_obj_query_tokens = 0
+    self.obj_query_n = 16
+    self.obj_query_radius = 32.0
+    self.obj_query_layers = 4
+    self.obj_query_pool = 1   # average-pool factor of bev_feature_grid before the queries read it (1 = full 64 x 64)
     # scheme C: make the tokens worth reading. Frames where a CONNECTED vehicle is hidden from the ego's lidar, is a moving
     # hazard ahead, and the expert slows down get v2x_occ_weight x loss on the planning heads; an auxiliary head must
     # predict "a hidden hazard exists" from the decoder features (loss only on samples that received tokens).
