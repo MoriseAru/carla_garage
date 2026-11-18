@@ -29,6 +29,7 @@ ap.add_argument("--out", required=True, help="output dir; may contain {s}, repla
 ap.add_argument("--save_at", default="", help="comma-separated steps at which to also save a checkpoint (dose curve, LOCAL 10766)")
 ap.add_argument("--root", default="/work/gn21/n21001/carla_garage_data_root")
 ap.add_argument("--steps", type=int, default=2000); ap.add_argument("--bs", type=int, default=16)
+ap.add_argument("--sched", choices=["const", "cos"], default="const", help="cos: cosine decay from --lr to 0 over --steps, no warmup (LOCAL 11043)")
 ap.add_argument("--lr", type=float, default=1e-4); ap.add_argument("--workers", type=int, default=32)
 ap.add_argument("--max_min", type=float, default=21.0, help="wall-clock guard for the training loop (minutes)")
 a = ap.parse_args()
@@ -137,6 +138,7 @@ def save(step):
 
 
 opt = torch.optim.AdamW([p for p in net.parameters() if p.requires_grad], lr=a.lr, amsgrad=True)
+sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda k: 0.5 * (1.0 + math.cos(math.pi * k / a.steps))) if a.sched == "cos" else None   # update k uses lr * f(k): f(0)=1, f(steps)=0
 w_ts, w_ck = float(cfg.detailed_loss_weights["loss_target_speed"]), float(cfg.detailed_loss_weights["loss_checkpoint"])
 t1 = time.time(); step = 0; run = []; run_at = []
 for data in dl:
@@ -162,11 +164,13 @@ for data in dl:
             loss = loss + a.attn_w * l_at
         run_at.append((float(l_at), float(sel.float().mean())))
     opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+    if sched is not None:
+        sched.step()
     step += 1; run.append((float(l_ts), float(l_ck)))
     if step % 100 == 0:
         m = np.mean(run[-100:], 0)
         ma = np.mean(run_at[-100:], 0) if run_at else (0.0, 0.0)
-        print(f"step {step} ts {m[0]:.4f} ckpt {m[1]:.4f} attn {ma[0]:.4f} (frames {ma[1]:.2f}) {(time.time()-t1)/step:.3f}s/step", flush=True)
+        print(f"step {step} ts {m[0]:.4f} ckpt {m[1]:.4f} attn {ma[0]:.4f} (frames {ma[1]:.2f}) lr {opt.param_groups[0]['lr']:.3e} {(time.time()-t1)/step:.3f}s/step", flush=True)
     if step in save_at and step != a.steps:
         save(step)
     if (time.time() - t1) / 60.0 > a.max_min:
