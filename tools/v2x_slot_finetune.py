@@ -113,7 +113,7 @@ class _DecSlot(torch.utils.data.Dataset):
 dl = torch.utils.data.DataLoader(_DecSlot(ds, idx) if a.attn_w > 0 else torch.utils.data.Subset(ds, idx), batch_size=a.bs, shuffle=False, num_workers=a.workers,
                                  drop_last=True, worker_init_fn=lambda w: np.random.seed(1000 + w))
 print(f"dataset {len(ds)} frames; using {len(idx)}; setup {time.time()-t0:.0f}s", flush=True)
-save_at = sorted({int(x) for x in a.save_at.split(",") if x.strip()})
+save_at = sorted({int(x) for x in a.save_at.replace(":", ",").split(",") if x.strip()})   # ":" also accepted (qsub -v splits on ",")
 assert not save_at or "{s}" in a.out, "--save_at needs {s} in --out"
 
 
